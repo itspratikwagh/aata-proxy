@@ -29,14 +29,15 @@ let cachedSheetData = {};
 let cachedClassData = [];
 let lastSheetFetch = 0;
 let lastSFFetch = 0;
-const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+const SHEET_CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours for Google Sheet (static data)
+const SF_CACHE_DURATION = 5 * 60 * 1000; // 5 minutes for Salesforce (live class data)
 
 // ============================================================
 // FETCH GOOGLE SHEET DATA
 // ============================================================
 async function fetchGoogleSheet() {
   const now = Date.now();
-  if (now - lastSheetFetch < CACHE_DURATION && Object.keys(cachedSheetData).length > 0) {
+  if (now - lastSheetFetch < SHEET_CACHE_DURATION && Object.keys(cachedSheetData).length > 0) {
     return cachedSheetData;
   }
 
@@ -71,7 +72,7 @@ async function fetchGoogleSheet() {
 // ============================================================
 async function fetchSalesforceClasses() {
   const now = Date.now();
-  if (now - lastSFFetch < CACHE_DURATION && cachedClassData.length > 0) {
+  if (now - lastSFFetch < SF_CACHE_DURATION && cachedClassData.length > 0) {
     return cachedClassData;
   }
 
