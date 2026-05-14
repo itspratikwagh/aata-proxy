@@ -209,14 +209,43 @@ ${classSection}
 - Must be 18+
 
 ## AUTOMATED ENROLLMENT PROCESS
-The enrollment is fully automated — the student only does ONE manual step (filling the inline form). After that, everything else happens automatically via email:
+The enrollment is fully automated. The student does NOT fill any external form. Instead, you collect a few basic details conversationally, then submit them to Salesforce via a special marker — everything else happens automatically via email after that.
 
-### Step 1 — Inline Enrollment Form (the ONLY manual step)
-- When the student is ready to enroll, include the EXACT text [SHOW_ENROLLMENT_FLOW] in your response (this triggers the inline form)
-- IMPORTANT: You MUST include the literal text [SHOW_ENROLLMENT_FLOW] (with brackets) in your message. Do not describe form fields or link to an external page — just include the marker and the form will appear automatically.
-- Before showing the form, confirm which class they prefer (refer to the LIVE CLASSES section above)
-- The form collects: personal info, class selection, and basic contact details
-- After they submit, tell them: "Thanks! You'll receive the DAS 1 Apprentice Agreement in your email within a minute or two — please sign it via Box Sign. Once you sign, we'll automatically email you the next two steps (Foothill College enrollment and book fee payment instructions)."
+### Step 1 — Conversational data collection (the ONLY manual step)
+
+You will collect these fields, ONE AT A TIME, conversationally. Validate as you go:
+
+1. **First name**
+2. **Last name**
+3. **Email** (must contain @)
+4. **Mobile phone** (US, with area code)
+5. **Mailing street address** (street + apt/unit)
+6. **City**
+7. **State** (2-letter code)
+8. **Zip code** (5 digits)
+9. **Class preference** — must be one of: \`Day Class\` or \`Night Class\` (refer to LIVE CLASSES section above for current schedule + spots)
+
+Rules for collection:
+- Ask for ONE field at a time. Wait for the user's reply before asking the next.
+- If they give multiple fields in one message, accept them and ask for the next missing one.
+- If a value looks invalid (no @ in email, fewer than 10 digits in phone), politely ask them to confirm.
+- If they say "I don't have a phone" / "skip this" — politely insist; all fields are required for the State of California Apprenticeship Agreement.
+
+Once ALL 9 fields are collected, summarize them back ("Let me confirm: First name X, last name Y, email Z, ..."), then ask "Does that all look right?"
+
+When they confirm (yes/correct/looks good/etc.), emit a single message containing ONLY the following marker as the LAST line of your response (after a friendly confirmation sentence):
+
+\`[CREATE_ENROLLMENT]{"firstName":"...","lastName":"...","email":"...","mobilePhone":"...","mailingStreet":"...","mailingCity":"...","mailingState":"...","mailingPostalCode":"...","classSelection":"Day Class"}\`
+
+CRITICAL FORMAT RULES for the marker:
+- Use exact key names shown above. Use \`Day Class\` or \`Night Class\` for classSelection (no dates, no extra words).
+- Wrap the JSON on a SINGLE line, no line breaks inside it. Use double quotes only. Escape any double quotes in user data.
+- Put NOTHING after the marker — it must be the last thing in your message.
+- Do NOT explain the marker to the user. Just emit a friendly "Submitting your enrollment now..." sentence and then the marker on the next line.
+
+The frontend will detect the marker, hide it from view, send the JSON to Salesforce, and show a green confirmation card with what's next.
+
+If the user says "wait, I want to change X" before confirming, update the field and re-summarize. Don't submit until they explicitly confirm.
 
 ### What happens automatically AFTER Step 1:
 1. **DAS 1 e-signature** — student receives a Box Sign email with the DAS 1 Apprentice Agreement (most fields pre-filled). They complete the SSN/military/etc. section and sign electronically. SSN is required by State of California Division of Apprenticeship Standards (DAS).
@@ -242,11 +271,11 @@ The chatbot has a "Check my enrollment status" button. When they click it, look 
 When a student says they want to enroll or are ready to sign up:
 1. First, ask: "Which state do you currently reside in?"
 2. Based on their answer:
-   - California resident → Explain tuition is FREE, then ask which class they prefer (Day or Night) — mention spots remaining from LIVE CLASSES section
+   - California resident → Explain tuition is FREE, then begin the conversational data collection (Step 1 above)
    - Texas resident → Direct them to contact Patrick Kratochvil at ${get("phone_tx", "(281) 676-0356")} or ${get("email_tx", "patrickaata@gmail.com")} for enrollment
    - Out-of-state resident → Explain funding is handled case by case, direct them to leave a message at https://www.aatatraining.org/apply
-3. For CA residents: After class selection, include [SHOW_ENROLLMENT_FLOW] to trigger the inline form
-4. After form submit, set expectations about the auto-emails and that's it — no more manual steps needed
+3. For CA residents: collect the 9 fields one by one, confirm, then emit the [CREATE_ENROLLMENT] marker
+4. After the marker is emitted, set expectations about the auto-emails (DAS in 1-2 min, then 2 auto-emails after they sign) — no more manual steps
 
 IMPORTANT RULES ABOUT VETERANS:
 - Do NOT ask if someone is a veteran as a qualifying question
@@ -279,8 +308,8 @@ If a student asks to speak with a person, be connected to an agent, or wants to 
 - If someone is a TX resident, warmly direct them to Patrick Kratochvil
 - NEVER proactively mention veteran benefits or veteran-specific funding
 - Create urgency about limited spots (mention exact spots remaining for each class)
-- For CA students, after they pick a class, include [SHOW_ENROLLMENT_FLOW] to trigger the form — don't make them wait
-- After form submit, set expectations: DAS email arrives in 1-2 min, then 2 auto-emails after they sign
+- For CA students, after they pick a class, begin the conversational data collection (one field at a time) and emit [CREATE_ENROLLMENT]{...} once everything is confirmed
+- After the [CREATE_ENROLLMENT] marker is emitted, set expectations: DAS email arrives in 1-2 min, then 2 auto-emails after they sign
 - If you don't know something specific, direct them to contact AATA directly
 - Keep responses concise: 3-6 sentences for simple questions, more detail only when asked
 - Never make up information not in your knowledge base — direct to AATA contact instead
@@ -307,6 +336,120 @@ app.post("/api/chat", async (req, res) => {
   } catch (err) {
     console.error("API Error:", err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// CREATE ENROLLMENT — chatbot-collected data → SF Contact + Class Registration
+// Triggers AATA_ContactEnrollmentTrigger (Apex) which fires Box Sign DAS
+// ============================================================
+async function sfCreate(sObject, payload) {
+  if (!sfAuth.access_token) await sfAuthenticate();
+  const url = `${sfAuth.instance_url}/services/data/v59.0/sobjects/${sObject}`;
+  let res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${sfAuth.access_token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  if (res.status === 401) {
+    await sfAuthenticate();
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${sfAuth.access_token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+  }
+  return { status: res.status, body: await res.json() };
+}
+
+app.post("/api/create-enrollment", async (req, res) => {
+  const REQUIRED = [
+    "firstName", "lastName", "email", "mobilePhone",
+    "mailingStreet", "mailingCity", "mailingState", "mailingPostalCode",
+    "classSelection",
+  ];
+  const data = req.body || {};
+  const missing = REQUIRED.filter((k) => !data[k] || String(data[k]).trim() === "");
+  if (missing.length) {
+    return res.status(400).json({ ok: false, error: "Missing required fields", missing });
+  }
+  if (!String(data.email).includes("@")) {
+    return res.status(400).json({ ok: false, error: "Invalid email" });
+  }
+  if (!["Day Class", "Night Class"].includes(data.classSelection)) {
+    return res.status(400).json({
+      ok: false,
+      error: `classSelection must be "Day Class" or "Night Class", got "${data.classSelection}"`,
+    });
+  }
+  if (!SF_CLIENT_ID || !SF_CLIENT_SECRET) {
+    return res.status(500).json({ ok: false, error: "SF credentials not configured" });
+  }
+
+  try {
+    // 1. Find the matching open class in Salesforce (by Day vs Night in Name)
+    const classFilter = data.classSelection === "Day Class" ? "DAY" : "NIGHT";
+    const classQuery = await sfQuery(
+      `SELECT Id, Name, yClasses__First_Session_Date__c, Spots_Remaining__c ` +
+      `FROM yClasses__Class__c WHERE Registration_Open__c = true AND Name LIKE '%${classFilter}%' ` +
+      `ORDER BY yClasses__First_Session_Date__c ASC LIMIT 1`
+    );
+    const matchedClass = (classQuery.records || [])[0];
+    if (!matchedClass) {
+      return res.status(409).json({
+        ok: false,
+        error: `No open ${data.classSelection} found. Please contact info@aatatraining.org.`,
+      });
+    }
+
+    // 2. Create the Contact (Apex trigger fires Box Sign on insert)
+    const contactPayload = {
+      FirstName: data.firstName,
+      LastName: data.lastName,
+      Email: data.email,
+      MobilePhone: data.mobilePhone,
+      MailingStreet: data.mailingStreet,
+      MailingCity: data.mailingCity,
+      MailingState: data.mailingState,
+      MailingPostalCode: data.mailingPostalCode,
+      Class_Selection__c: data.classSelection,
+      Enrollment_Status__c: "Step 1 Complete",
+      Enrollment_Source__c: "AI Chatbot",
+    };
+    const contactRes = await sfCreate("Contact", contactPayload);
+    if (contactRes.status !== 201 || !contactRes.body.id) {
+      console.error("Contact create failed:", contactRes.body);
+      return res.status(500).json({ ok: false, error: "Contact create failed", details: contactRes.body });
+    }
+    const contactId = contactRes.body.id;
+    console.log("Created Contact:", contactId, "for", data.email);
+
+    // 3. Create the Class Registration linking student to the matched class
+    const regRes = await sfCreate("yClasses__Class_Registration__c", {
+      yClasses__Student__c: contactId,
+      yClasses__Class__c: matchedClass.Id,
+    });
+    if (regRes.status !== 201) {
+      console.error("Class registration create warning:", regRes.body);
+      // Don't fail — contact + DAS still proceed
+    }
+
+    res.json({
+      ok: true,
+      contactId,
+      className: matchedClass.Name,
+      classStartDate: matchedClass.yClasses__First_Session_Date__c,
+      message: "Contact created. DAS 1 e-signature email will arrive within 1-2 minutes.",
+    });
+  } catch (err) {
+    console.error("Create enrollment error:", err.message);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
