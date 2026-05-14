@@ -454,6 +454,29 @@ app.post("/api/create-enrollment", async (req, res) => {
 });
 
 // ============================================================
+// WEBHOOK CAPTURE — diagnostic-only. Logs incoming POSTs in memory and
+// returns 200, so we can see whether Box is actually delivering anything.
+// View captured calls via GET /api/webhook-capture/log
+// ============================================================
+const webhookCaptureLog = [];
+app.post("/api/webhook-capture", express.text({ type: "*/*" }), (req, res) => {
+  const entry = {
+    ts: new Date().toISOString(),
+    method: req.method,
+    headers: req.headers,
+    body: typeof req.body === "string" ? req.body : JSON.stringify(req.body),
+    ip: req.ip || req.headers["x-forwarded-for"] || null,
+  };
+  webhookCaptureLog.push(entry);
+  if (webhookCaptureLog.length > 50) webhookCaptureLog.shift();
+  console.log("[WEBHOOK-CAPTURE]", entry.ts, "from", entry.ip, "body:", entry.body.slice(0, 200));
+  res.status(200).json({ captured: true });
+});
+app.get("/api/webhook-capture/log", (req, res) => {
+  res.json({ count: webhookCaptureLog.length, entries: webhookCaptureLog });
+});
+
+// ============================================================
 // ENROLLMENT STATUS ENDPOINT (returning student lookup)
 // ============================================================
 app.get("/api/enrollment-status", async (req, res) => {
