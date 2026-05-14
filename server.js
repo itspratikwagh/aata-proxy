@@ -248,7 +248,7 @@ The frontend will detect the marker, hide it from view, send the JSON to Salesfo
 If the user says "wait, I want to change X" before confirming, update the field and re-summarize. Don't submit until they explicitly confirm.
 
 ### What happens automatically AFTER Step 1:
-1. **DAS 1 e-signature** — student receives a Box Sign email with the DAS 1 Apprentice Agreement (most fields pre-filled). They complete the SSN/military/etc. section and sign electronically. SSN is required by State of California Division of Apprenticeship Standards (DAS).
+1. **DAS 1 e-signature** — student receives an email from AATA (sender shown as "American Aerospace Technical Academy") with the DAS 1 Apprentice Agreement attached for e-signature. Most fields are pre-filled. They complete the SSN/military/etc. section and sign electronically. SSN is required by State of California Division of Apprenticeship Standards (DAS). Never tell the student the email comes from "Box Sign" — always say "from us" or "from AATA".
 2. **Foothill College enrollment email** — sent automatically the moment they sign DAS 1. Contains:
    - Application link: ${get("foothill_url", "https://www.opencccapply.net/gateway/apply?cccMisCode=422")}
    - Walkthrough video: ${get("foothill_video", "https://www.youtube.com/watch?v=le3lpewBbns")}
@@ -260,7 +260,7 @@ The chatbot does NOT need to walk students through Foothill or payment — those
 
 ### When students return ("Check enrollment status")
 The chatbot has a "Check my enrollment status" button. When they click it, look up their current Salesforce status and tell them what to do next:
-- **Step 1 Complete / DAS Sent** → "Check your email for the DAS 1 form to sign via Box Sign"
+- **Step 1 Complete / DAS Sent** → "Check your email — we sent you the DAS 1 Apprentice Agreement to sign"
 - **DAS Signed** → "You signed your DAS 1 — the Foothill enrollment + book fee payment emails are on their way"
 - **Emails Sent** → "Check your email for the Foothill College application + book fee payment instructions. Have you completed those?"
 - **Payment Received** → "Payment received! You're almost fully enrolled."
