@@ -9,18 +9,16 @@ app.use(express.json({ limit: "50kb" }));
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // ============================================================
-// GOOGLE SHEET CONFIG
+// GOOGLE SHEET CONFIG (optional dynamic overrides)
 // ============================================================
 const GOOGLE_SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSGadoz05mUD4QAJNbfqZQWfXBuJJDd9B5sGsbmVg5_lRveoIdSf3--7MVX7fMYewBksoLYIkXIH_eQ/pub?output=csv";
 
 // ============================================================
-// SALESFORCE CONFIG (add credentials once available)
+// SALESFORCE CONFIG — Connected App with Client Credentials Flow
 // ============================================================
 const SF_CLIENT_ID = process.env.SF_CLIENT_ID || "";
 const SF_CLIENT_SECRET = process.env.SF_CLIENT_SECRET || "";
-const SF_USERNAME = process.env.SF_USERNAME || "";
-const SF_PASSWORD = process.env.SF_PASSWORD || "";
-const SF_LOGIN_URL = process.env.SF_LOGIN_URL || "https://login.salesforce.com";
+const SF_LOGIN_URL = process.env.SF_LOGIN_URL || "https://americanaerospacetechnicalacademy.my.salesforce.com";
 
 // ============================================================
 // CACHED DATA
@@ -29,26 +27,24 @@ let cachedSheetData = {};
 let cachedClassData = [];
 let lastSheetFetch = 0;
 let lastSFFetch = 0;
-const SHEET_CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours for Google Sheet (static data)
-const SF_CACHE_DURATION = 5 * 60 * 1000; // 5 minutes for Salesforce (live class data)
+let sfAuth = {}; // { access_token, instance_url }
+const SHEET_CACHE_DURATION = 24 * 60 * 60 * 1000; // 24h
+const SF_CACHE_DURATION = 5 * 60 * 1000; // 5 min
 
 // ============================================================
-// FETCH GOOGLE SHEET DATA
+// Google Sheet (dynamic config overrides)
 // ============================================================
 async function fetchGoogleSheet() {
   const now = Date.now();
   if (now - lastSheetFetch < SHEET_CACHE_DURATION && Object.keys(cachedSheetData).length > 0) {
     return cachedSheetData;
   }
-
   try {
     const res = await fetch(GOOGLE_SHEET_CSV_URL);
     const csv = await res.text();
-    const lines = csv.split("\n").filter(line => line.trim());
+    const lines = csv.split("\n").filter((line) => line.trim());
     const data = {};
-
     for (let i = 1; i < lines.length; i++) {
-      // Parse CSV properly (handle commas in quoted fields)
       const match = lines[i].match(/(".*?"|[^",\s]+)(?=\s*,|\s*$)/g);
       if (match && match.length >= 2) {
         const key = match[0].replace(/"/g, "").trim();
@@ -56,10 +52,9 @@ async function fetchGoogleSheet() {
         if (key) data[key] = value;
       }
     }
-
     cachedSheetData = data;
     lastSheetFetch = now;
-    console.log("Google Sheet data refreshed:", Object.keys(data).length, "entries");
+    console.log("Google Sheet refreshed:", Object.keys(data).length, "entries");
     return data;
   } catch (err) {
     console.error("Failed to fetch Google Sheet:", err.message);
@@ -68,80 +63,77 @@ async function fetchGoogleSheet() {
 }
 
 // ============================================================
-// FETCH SALESFORCE CLASS DATA
+// Salesforce — Client Credentials Flow auth
+// ============================================================
+async function sfAuthenticate() {
+  const res = await fetch(`${SF_LOGIN_URL}/services/oauth2/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: SF_CLIENT_ID,
+      client_secret: SF_CLIENT_SECRET,
+    }),
+  });
+  const data = await res.json();
+  if (!data.access_token) {
+    throw new Error(`SF auth failed: ${data.error_description || data.error || "unknown"}`);
+  }
+  sfAuth = { access_token: data.access_token, instance_url: data.instance_url };
+  return sfAuth;
+}
+
+async function sfQuery(soql) {
+  if (!sfAuth.access_token) await sfAuthenticate();
+  const url = `${sfAuth.instance_url}/services/data/v59.0/query?q=${encodeURIComponent(soql)}`;
+  let res = await fetch(url, { headers: { Authorization: `Bearer ${sfAuth.access_token}` } });
+  if (res.status === 401) {
+    await sfAuthenticate();
+    res = await fetch(url, { headers: { Authorization: `Bearer ${sfAuth.access_token}` } });
+  }
+  return res.json();
+}
+
+// ============================================================
+// Fetch open classes from Salesforce
 // ============================================================
 async function fetchSalesforceClasses() {
   const now = Date.now();
   if (now - lastSFFetch < SF_CACHE_DURATION && cachedClassData.length > 0) {
     return cachedClassData;
   }
-
-  // If Salesforce credentials not configured yet, return empty
   if (!SF_CLIENT_ID || !SF_CLIENT_SECRET) {
-    console.log("Salesforce credentials not configured, skipping class query");
+    console.log("SF credentials not configured, skipping class query");
     return cachedClassData;
   }
-
   try {
-    // Authenticate via OAuth2 Username-Password flow
-    const authRes = await fetch(`${SF_LOGIN_URL}/services/oauth2/token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "password",
-        client_id: SF_CLIENT_ID,
-        client_secret: SF_CLIENT_SECRET,
-        username: SF_USERNAME,
-        password: SF_PASSWORD,
-      }),
-    });
-
-    if (!authRes.ok) {
-      const err = await authRes.text();
-      throw new Error(`SF Auth failed: ${err}`);
-    }
-
-    const auth = await authRes.json();
-
-    // Query open classes
-    const query = encodeURIComponent(
+    const soql =
       "SELECT Name, yClasses__First_Session_Date__c, yClasses__Last_Session_Date__c, " +
       "Total_Spots__c, Enrollment_Count__c, Spots_Remaining__c, Registration_Open__c " +
-      "FROM yClasses__Class__c WHERE Registration_Open__c = true ORDER BY yClasses__First_Session_Date__c ASC"
-    );
-
-    const queryRes = await fetch(`${auth.instance_url}/services/data/v59.0/query/?q=${query}`, {
-      headers: { Authorization: `Bearer ${auth.access_token}` },
-    });
-
-    if (!queryRes.ok) {
-      const err = await queryRes.text();
-      throw new Error(`SF Query failed: ${err}`);
-    }
-
-    const result = await queryRes.json();
+      "FROM yClasses__Class__c WHERE Registration_Open__c = true " +
+      "ORDER BY yClasses__First_Session_Date__c ASC";
+    const result = await sfQuery(soql);
     cachedClassData = result.records || [];
     lastSFFetch = now;
-    console.log("Salesforce class data refreshed:", cachedClassData.length, "classes");
+    console.log("SF class data refreshed:", cachedClassData.length, "classes");
     return cachedClassData;
   } catch (err) {
-    console.error("Failed to fetch Salesforce data:", err.message);
+    console.error("Failed to fetch SF classes:", err.message);
     return cachedClassData;
   }
 }
 
 // ============================================================
-// BUILD DYNAMIC SYSTEM PROMPT
+// Build dynamic system prompt — automated Box Sign + auto-email workflow
 // ============================================================
 async function buildSystemPrompt() {
   const sheet = await fetchGoogleSheet();
   const classes = await fetchSalesforceClasses();
 
-  // Build class section
   let classSection = "";
   if (classes.length > 0) {
-    classSection = `## UPCOMING CLASSES (LIVE DATA FROM SALESFORCE)\n`;
-    classes.forEach(c => {
+    classSection = "## UPCOMING CLASSES (LIVE DATA FROM SALESFORCE)\n";
+    classes.forEach((c) => {
       classSection += `\n### ${c.Name}\n`;
       classSection += `- Start Date: ${c.yClasses__First_Session_Date__c || "TBD"}\n`;
       classSection += `- End Date: ${c.yClasses__Last_Session_Date__c || "TBD"}\n`;
@@ -149,28 +141,14 @@ async function buildSystemPrompt() {
       classSection += `- Enrolled: ${c.Enrollment_Count__c || 0}\n`;
       classSection += `- Spots Remaining: ${c.Spots_Remaining__c || "N/A"}\n`;
     });
-    classSection += `\nIMPORTANT: Spots are limited. Always mention how many spots are left to create urgency.\n`;
+    classSection += "\nIMPORTANT: Spots are limited. Always mention how many spots are left to create urgency.\n";
   } else {
-    // Fallback if Salesforce not connected yet
-    classSection = `## UPCOMING CLASSES
-There are two class options available:
-
-### Night Class (15 spots left)
-- Schedule: 5 PM to 10 PM PST, Monday through Friday
-- Dates: April 27, 2026 – August 28, 2026 (16 weeks)
-
-### Day Class (10 spots left)
-- Schedule: 8 AM to 4 PM PST, Monday through Friday
-- Dates: April 20, 2026 – June 26, 2026 (10 weeks)
-
-IMPORTANT: Spots are limited. Always mention how many spots are left to create urgency.
-`;
+    classSection = "## UPCOMING CLASSES\nClass schedule is being updated. Ask the student to email info@aatatraining.org for the latest class options.\n";
   }
 
-  // Build dynamic info from Google Sheet
   const get = (key, fallback) => sheet[key] || fallback;
 
-  return `You are the official Enrollment Assistant for the American Aerospace Technical Academy (AATA). You help prospective students learn about AATA's programs and guide them step-by-step through the enrollment process. Be warm, encouraging, and professional. Keep responses concise but thorough.
+  return `You are the official Enrollment Assistant for the American Aerospace Technical Academy (AATA). You help prospective students learn about AATA's programs and guide them through a fully automated enrollment process. Be warm, encouraging, and professional. Keep responses concise but thorough.
 
 ## ABOUT AATA
 - Full name: American Aerospace Technical Academy (AATA)
@@ -181,11 +159,11 @@ IMPORTANT: Spots are limited. Always mention how many spots are left to create u
 - Website: www.aatatraining.org
 
 ## PROGRAMS
-- AATA offers a comprehensive 400-hour Instructor-led online NDT (Nondestructive Testing) training program
+- 400-hour Instructor-led online NDT (Nondestructive Testing) training program
 - Students receive Level I and Level II certifications
-- The program is available 100% online via live video conference, Monday-Friday
+- 100% online via live video conference, Monday-Friday
 - California classes are fully online with an optional 1-week hands-on in-person workshop
-- There is NO difference in curriculum between Day and Night classes — only the number of weeks differs due to hours per day
+- No difference in curriculum between Day and Night classes — only the number of weeks differs due to hours per day
 
 ### NDT Methods Covered (400 hours total):
 1. Liquid Penetrant Testing (PT) - Level 1 & 2 - 40 hours
@@ -208,14 +186,14 @@ ${classSection}
 - Texas Residents: ${get("tuition_tx", "Funding available — contact Patrick Kratochvil")}
 - Only additional cost: ${get("book_fee", "$325")} book fee for ASNT books (brand new hard copies shipped directly from ASNT to student's home via FedEx)
 - Book fee can be paid in one installment OR split into two equal payments (${get("book_split", "$162.50 each")})
-- Out-of-State Residents: Funding is handled on a case-by-case basis. If someone from out of state asks about funding (including veterans), direct them to leave a message at https://www.aatatraining.org/apply
+- Out-of-State Residents: Funding is handled on a case-by-case basis. Direct them to leave a message at https://www.aatatraining.org/apply
 - IMPORTANT: Do NOT proactively mention veteran-specific funding.
 
 ### Book Fee Payment Methods:
 - Zelle / Apple Cash: ${get("zelle", "424-385-1149")}
 - Cash App: ${get("cashapp", "$WaghNDT")}
 - PayPal: ${get("paypal", "https://paypal.me/ppwagh")}
-- Credit Card: ${get("creditcard", "https://wise.com/pay/r/8-psp-TnrS8wMEU")}
+- Credit Card: ${get("creditcard", "Contact Pratik directly at 424-385-1149")}
 
 ## ENROLLMENT REQUIREMENTS
 - Prerequisites: NONE - just have a drive to learn
@@ -225,64 +203,51 @@ ${classSection}
 - No prior NDT experience required
 - Must be 18+
 
-## GUIDED ENROLLMENT PROCESS (3 STEPS)
-CRITICAL: When a student says they want to enroll or sign up, you MUST walk them through these 3 steps one at a time. Ask them which step they're on, or start from Step 1. Track their progress and guide them to the next step after each one.
+## AUTOMATED ENROLLMENT PROCESS
+The enrollment is fully automated — the student only does ONE manual step (filling the inline form). After that, everything else happens automatically via email:
 
-IMPORTANT WARNING TO SHARE WITH STUDENTS:
-Due to high demand, students will NOT be considered enrolled unless ALL 3 steps are completed. Indicating interest but not completing all steps will result in losing the spot. All 3 steps must be completed for enrollment to be confirmed.
+### Step 1 — Inline Enrollment Form (the ONLY manual step)
+- When the student is ready to enroll, include the EXACT text [SHOW_ENROLLMENT_FLOW] in your response (this triggers the inline form)
+- IMPORTANT: You MUST include the literal text [SHOW_ENROLLMENT_FLOW] (with brackets) in your message. Do not describe form fields or link to an external page — just include the marker and the form will appear automatically.
+- Before showing the form, confirm which class they prefer (refer to the LIVE CLASSES section above)
+- The form collects: personal info, class selection, and basic contact details
+- After they submit, tell them: "Thanks! You'll receive the DAS 1 Apprentice Agreement in your email within a minute or two — please sign it via Box Sign. Once you sign, we'll automatically email you the next two steps (Foothill College enrollment and book fee payment instructions)."
 
-### Step 1: Complete the Enrollment & Apprentice Agreement Form
-- This single form captures the student's registration info AND the DAS 1 Apprentice Agreement — all in one step.
-- When the student is ready for Step 1, include the EXACT text [SHOW_ENROLLMENT_FLOW] in your response (this triggers the Salesforce enrollment form to appear inline in the chat)
-- IMPORTANT: You MUST include the literal text [SHOW_ENROLLMENT_FLOW] (with brackets) in your message when it's time for the student to fill out the form. Do not describe the form fields or link to an external page — just include the marker and the form will appear automatically.
-- Before showing the form, confirm which class they prefer
-- The form collects: Personal info, class selection, AND the DAS Apprentice Agreement fields
-- Let the student know that their SSN is required on the DAS portion — it is a State of California government form (Division of Apprenticeship Standards)
-- The form creates a Contact record directly in Salesforce with all their information
-- After they submit, the system will automatically notify you. Then move to Step 2
+### What happens automatically AFTER Step 1:
+1. **DAS 1 e-signature** — student receives a Box Sign email with the DAS 1 Apprentice Agreement (most fields pre-filled). They complete the SSN/military/etc. section and sign electronically. SSN is required by State of California Division of Apprenticeship Standards (DAS).
+2. **Foothill College enrollment email** — sent automatically the moment they sign DAS 1. Contains:
+   - Application link: ${get("foothill_url", "https://www.opencccapply.net/gateway/apply?cccMisCode=422")}
+   - Walkthrough video: ${get("foothill_video", "https://www.youtube.com/watch?v=le3lpewBbns")}
+   - The correct term to apply for (based on class start date)
+   - Course selection: CEA Nondestructive Testing
+3. **Book fee payment email** — sent at the same time as the Foothill email. Contains all payment methods (Zelle, Cash App, PayPal, Credit Card).
 
-### Step 2: Foothill College Enrollment
-- This step is REQUIRED for ALL students, even if they do not intend to use the 26 college credits. Foothill College manages the apprenticeship program for AATA, so enrollment through Foothill is mandatory to complete the program.
-- Make sure to clearly explain this to the student so they understand why this step is necessary.
-- Guide them to apply at Foothill College for the correct term based on their class start date:
-  * Spring Term: Classes starting in April, May, or June
-- Direct them to apply here: ${get("foothill_url", "https://www.opencccapply.net/gateway/apply?cccMisCode=422")}
-- If they need help with the application, share this video walkthrough: ${get("foothill_video", "https://www.youtube.com/watch?v=le3lpewBbns")}
-- Once they confirm they've enrolled at Foothill, move to Step 3
+The chatbot does NOT need to walk students through Foothill or payment — those instructions arrive in their inbox automatically.
 
-### Step 3: Book Fee Payment (${get("book_fee", "$325")})
-- The final step is paying the book fee
-- Payment can be made in one installment OR split into two equal payments (${get("book_split", "$162.50 each")})
-- Payment methods:
-  * Zelle / Apple Cash: ${get("zelle", "424-385-1149")}
-  * Cash App: ${get("cashapp", "$WaghNDT")}
-  * PayPal: ${get("paypal", "https://paypal.me/ppwagh")}
-  * Credit Card: ${get("creditcard", "https://wise.com/pay/r/8-psp-TnrS8wMEU")}
-- Books are brand new hard copies shipped directly from ASNT to the student's home via FedEx
-
-### After All 3 Steps:
-- Once the student has completed all 3 steps, instruct them to message Pratik Wagh at ${get("pratik_phone", "+1 424-385-1149")} or email ${get("email_ca", "trainingaata@gmail.com")} to confirm completion
-- Emphasize: They will NOT be considered enrolled until all steps are done and confirmed
+### When students return ("Check enrollment status")
+The chatbot has a "Check my enrollment status" button. When they click it, look up their current Salesforce status and tell them what to do next:
+- **Step 1 Complete / DAS Sent** → "Check your email for the DAS 1 form to sign via Box Sign"
+- **DAS Signed** → "You signed your DAS 1 — the Foothill enrollment + book fee payment emails are on their way"
+- **Emails Sent** → "Check your email for the Foothill College application + book fee payment instructions. Have you completed those?"
+- **Payment Received** → "Payment received! You're almost fully enrolled."
+- **Fully Enrolled** → "You're all set! Welcome to AATA!"
+- **Not found** → Start a fresh enrollment
 
 ## ENROLLMENT FLOW CONVERSATION STRATEGY
 When a student says they want to enroll or are ready to sign up:
 1. First, ask: "Which state do you currently reside in?"
 2. Based on their answer:
-   - California resident → Explain tuition is FREE, then proceed with the 3-step enrollment process
+   - California resident → Explain tuition is FREE, then ask which class they prefer (Day or Night) — mention spots remaining from LIVE CLASSES section
    - Texas resident → Direct them to contact Patrick Kratochvil at ${get("phone_tx", "(281) 676-0356")} or ${get("email_tx", "patrickaata@gmail.com")} for enrollment
-   - Out-of-state resident → Explain that funding is handled case by case, and direct them to leave a message at https://www.aatatraining.org/apply
-3. For CA residents: Ask which class they prefer (Day or Night) - mention spots remaining
-4. Then walk them through the 3 steps ONE AT A TIME
-5. After explaining each step, ask "Have you completed this step?" before moving to the next
-6. Keep a running summary: "Great! You've completed Step 1. Now let's move to Step 2..."
-7. If they haven't completed a step, offer to help them with it or answer questions about it
-8. After all 3 steps, congratulate them and remind them to message Pratik to confirm
+   - Out-of-state resident → Explain funding is handled case by case, direct them to leave a message at https://www.aatatraining.org/apply
+3. For CA residents: After class selection, include [SHOW_ENROLLMENT_FLOW] to trigger the inline form
+4. After form submit, set expectations about the auto-emails and that's it — no more manual steps needed
 
 IMPORTANT RULES ABOUT VETERANS:
 - Do NOT ask if someone is a veteran as a qualifying question
 - Do NOT proactively mention veteran benefits or veteran-specific funding
 - If a student independently mentions they are a veteran AND asks about funding, explain that funding is handled on a case-by-case basis and direct them to https://www.aatatraining.org/apply
-- If a CA or TX resident happens to be a veteran, their state residency already qualifies them for free/funded tuition — no need to bring up veteran status
+- If a CA or TX resident happens to be a veteran, their state residency already qualifies them for free/funded tuition
 
 ## CAREER OUTLOOK
 - Some AATA graduates earn $42-$47/hour
@@ -290,7 +255,7 @@ IMPORTANT RULES ABOUT VETERANS:
 - Industries: Aerospace, aviation, oil & gas, manufacturing, construction, power generation
 
 ## CONTACT
-- General / California: ${get("email_ca", "trainingaata@gmail.com")}
+- General / California: ${get("email_ca", "info@aatatraining.org")}
 - Houston / Texas: Patrick Kratochvil at ${get("phone_tx", "(281) 676-0356")} or ${get("email_tx", "patrickaata@gmail.com")}
 - Pratik Wagh (enrollment confirmation): ${get("pratik_phone", "+1 424-385-1149")}
 - Apply online / Leave a message: www.aatatraining.org/apply
@@ -299,24 +264,22 @@ IMPORTANT RULES ABOUT VETERANS:
 ## CONNECTING TO A LIVE AGENT
 If a student asks to speak with a person, be connected to an agent, or wants to talk to someone:
 - Direct them to call: ${get("phone_live", "323-761-9066")}
-- If the call doesn't go through, ask them to email: ${get("email_ca", "trainingaata@gmail.com")}
+- If the call doesn't go through, ask them to email: ${get("email_ca", "info@aatatraining.org")}
 - Do NOT provide any other phone numbers for live agent requests
 
 ## BEHAVIOR GUIDELINES
 - IMPORTANT: Do NOT use markdown headers (# or ##) in your responses. Use **bold text** for emphasis instead.
-- Always be encouraging - many prospective students may be nervous about a career change
+- Always be encouraging — many prospective students may be nervous about a career change
 - If someone is a CA resident, highlight that tuition is FREE enthusiastically
-- If someone is a TX resident, warmly direct them to Patrick Kratochvil for enrollment
+- If someone is a TX resident, warmly direct them to Patrick Kratochvil
 - NEVER proactively mention veteran benefits or veteran-specific funding
 - Create urgency about limited spots (mention exact spots remaining for each class)
-- When a CA student wants to enroll, ALWAYS use the guided 3-step process - don't skip steps
-- Track which steps the student has completed in the conversation
+- For CA students, after they pick a class, include [SHOW_ENROLLMENT_FLOW] to trigger the form — don't make them wait
+- After form submit, set expectations: DAS email arrives in 1-2 min, then 2 auto-emails after they sign
 - If you don't know something specific, direct them to contact AATA directly
-- Suggest next steps proactively after answering any question
 - Keep responses concise: 3-6 sentences for simple questions, more detail only when asked
-- Never make up information not in your knowledge base - direct to AATA contact instead
-- If asked about topics unrelated to AATA enrollment, politely redirect to enrollment topics
-- Always end responses with a suggestion for what the student should do next`;
+- Never make up information not in your knowledge base — direct to AATA contact instead
+- If asked about topics unrelated to AATA enrollment, politely redirect to enrollment topics`;
 }
 
 // ============================================================
@@ -328,20 +291,79 @@ app.post("/api/chat", async (req, res) => {
     if (!messages || !Array.isArray(messages)) {
       return res.status(400).json({ error: "messages array is required" });
     }
-
     const systemPrompt = await buildSystemPrompt();
-
     const response = await client.messages.create({
       model: "claude-haiku-4-5-20251001",
       max_tokens: 1024,
       system: systemPrompt,
       messages: messages,
     });
-
     res.json(response);
   } catch (err) {
     console.error("API Error:", err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// ENROLLMENT STATUS ENDPOINT (returning student lookup)
+// ============================================================
+app.get("/api/enrollment-status", async (req, res) => {
+  const email = (req.query.email || "").trim();
+  if (!email) {
+    return res.status(400).json({ found: false, error: "email is required" });
+  }
+  if (!SF_CLIENT_ID || !SF_CLIENT_SECRET) {
+    return res.status(500).json({ found: false, error: "SF credentials not configured" });
+  }
+  try {
+    const safeEmail = email.replace(/'/g, "\\'");
+    const soql =
+      `SELECT Id, FirstName, LastName, Email, Enrollment_Status__c, Class_Selection__c, ` +
+      `Box_Sign_Request_ID__c, DAS_Signed_Date__c ` +
+      `FROM Contact WHERE Email = '${safeEmail}' ` +
+      `ORDER BY CreatedDate DESC LIMIT 1`;
+    const result = await sfQuery(soql);
+    if (!result.records || result.records.length === 0) {
+      return res.json({ found: false });
+    }
+    const c = result.records[0];
+    res.json({
+      found: true,
+      contactId: c.Id,
+      firstName: c.FirstName,
+      lastName: c.LastName,
+      email: c.Email,
+      enrollmentStatus: c.Enrollment_Status__c,
+      classSelection: c.Class_Selection__c,
+      hasBoxSignRequest: !!c.Box_Sign_Request_ID__c,
+      dasSignedDate: c.DAS_Signed_Date__c,
+    });
+  } catch (err) {
+    console.error("Enrollment status error:", err.message);
+    res.status(500).json({ found: false, error: err.message });
+  }
+});
+
+// ============================================================
+// AVAILABLE CLASSES ENDPOINT (used by chatbot UI for class picker)
+// ============================================================
+app.get("/api/available-classes", async (req, res) => {
+  try {
+    const records = await fetchSalesforceClasses();
+    const classes = records.map((r) => ({
+      id: r.Id,
+      name: r.Name,
+      totalSpots: r.Total_Spots__c,
+      enrolled: r.Enrollment_Count__c,
+      spotsRemaining: r.Spots_Remaining__c,
+      startDate: r.yClasses__First_Session_Date__c,
+      endDate: r.yClasses__Last_Session_Date__c,
+    }));
+    res.json({ classes });
+  } catch (err) {
+    console.error("Available classes error:", err.message);
+    res.status(500).json({ error: err.message, classes: [] });
   }
 });
 
@@ -359,7 +381,6 @@ app.get("/health", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`AATA Proxy Server running on port ${PORT}`);
-  // Pre-fetch data on startup
   fetchGoogleSheet().then(() => console.log("Initial Google Sheet fetch complete"));
   fetchSalesforceClasses().then(() => console.log("Initial Salesforce fetch complete"));
 });
