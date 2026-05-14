@@ -283,6 +283,26 @@ Always frame Step 1 as the BEGINNING of enrollment, never the end. Never referen
 
 The chatbot does NOT need to walk students through Foothill or payment — those instructions arrive in their inbox automatically.
 
+### Recovery: student says they signed the DAS but didn't get the follow-up emails
+Sometimes the automated email-send fails (a known Box → Salesforce delivery flakiness). If a student says any of:
+- "I signed the DAS but never got the Foothill / payment emails"
+- "I signed but no other emails came"
+- "Where are the next emails?"
+- (or anything similar implying they signed but the follow-up emails are missing)
+
+…you can manually trigger a re-send. First confirm the email address they used (don't assume — ask "Just to confirm, what email did you sign up with?"). Once they give you the email, emit a single message that ends with this marker on its own line:
+
+[RESEND_EMAILS]{"email":"student@example.com"}
+
+CRITICAL FORMAT RULES (same as [CREATE_ENROLLMENT]):
+- The marker MUST be the last thing in your message — no text after it.
+- JSON on a single line, double quotes only.
+- The frontend will hide the marker, call the resend endpoint, and show a confirmation card. Do NOT explain the marker to the user.
+
+After the marker fires the frontend will inject a [SYSTEM: Resend result ...] message — your follow-up should:
+- If success: "Done — I just re-sent both emails to [email]. Check your inbox in the next 30 seconds (and your spam folder just in case)."
+- If failure: apologize and offer the support email info@aatatraining.org.
+
 ### When students return ("Check enrollment status")
 The chatbot has a "Check my enrollment status" button. When they click it, look up their current Salesforce status and tell them what to do next:
 - **Step 1 Complete / DAS Sent** → "Check your email — we sent you the DAS 1 Apprentice Agreement to sign"
@@ -475,6 +495,39 @@ app.post("/api/create-enrollment", async (req, res) => {
   } catch (err) {
     console.error("Create enrollment error:", err.message);
     res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ============================================================
+// RESEND ENROLLMENT EMAILS — chatbot-initiated recovery path for when
+// the Box → SF webhook silently fails. Forwards to the SF Apex REST
+// endpoint with the FORCE_RESEND trigger.
+// ============================================================
+app.post("/api/resend-enrollment-emails", async (req, res) => {
+  const email = (req.body && req.body.email || "").trim();
+  if (!email || !email.includes("@")) {
+    return res.status(400).json({ ok: false, error: "Valid email is required" });
+  }
+  try {
+    const sfRes = await fetch(
+      "https://americanaerospacetechnicalacademy.my.salesforce-sites.com/services/apexrest/boxsign/webhook",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ trigger: "FORCE_RESEND", email }),
+      }
+    );
+    const body = await sfRes.json();
+    if (sfRes.status === 200 && body.status === "resent") {
+      return res.json({ ok: true, contactId: body.contactId, message: "Emails re-sent" });
+    }
+    if (sfRes.status === 404) {
+      return res.status(404).json({ ok: false, error: "We couldn't find an enrollment with that email. Did you maybe sign up with a different one?" });
+    }
+    return res.status(500).json({ ok: false, error: body.error || `SF returned ${sfRes.status}` });
+  } catch (err) {
+    console.error("Resend error:", err.message);
+    return res.status(500).json({ ok: false, error: err.message });
   }
 });
 
