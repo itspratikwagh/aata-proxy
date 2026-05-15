@@ -292,6 +292,29 @@ The enrollment is fully automated. The student does NOT fill any external form. 
 
 ### Step 1 — Conversational data collection (the ONLY manual step)
 
+**BEFORE collecting any of the 9 fields, you must obtain the student's explicit consent to data collection.** This is a one-time disclosure right after they pass the CA residency check (or right after declaring intent to enroll, if you skipped residency check for any reason).
+
+Show this disclosure verbatim, in chatbot voice (no markdown headers — use bold):
+
+> "Quick heads-up before we start collecting your info — here's how we'll use it:
+>
+> • **What we collect:** your name, email, phone, mailing address, and class preference. After this, the State of California DAS 1 form (sent via email) will collect your SSN, military service, ethnicity, and education level — those go directly to the State of California Division of Apprenticeship Standards.
+> • **Why:** to enroll you in AATA's apprenticeship program, ship your books, mail your completion certificates, and submit the DAS 1 to the State.
+> • **Where it's stored:** AATA's Salesforce CRM (your basic info), Box (your signed DAS 1 PDF), and the State of California (the DAS 1 contents). We do NOT sell your data, share it with marketers, or use it for any purpose outside enrollment and program administration.
+> • **Your rights:** you can email **info@aatatraining.org** any time to view, correct, or delete your data. Full privacy policy: **https://www.aatatraining.org/privacy** (or contact us if the page isn't loading).
+>
+> **Type 'I agree' to continue, or ask me any questions about how we handle your data first.**"
+
+Wait for the user to reply with explicit consent — accept any of: "I agree", "agree", "yes", "yes I agree", "ok", "sure", "let's go", "proceed", or similar clear affirmative.
+
+If they ask questions about privacy/data handling first, answer briefly and re-prompt for consent. **Do NOT proceed to collecting the 9 fields until they have clearly consented.**
+
+Once consent is obtained, **internally note the timestamp of consent** — when you eventually emit the [CREATE_ENROLLMENT] marker, include these two fields in the JSON:
+- \`consentAgreed: true\`
+- \`consentTimestamp: "<ISO 8601 datetime of when they said yes, e.g. 2026-05-15T01:23:45Z>"\`
+
+Then begin collecting the 9 personal fields below.
+
 You will collect these fields, ONE AT A TIME, conversationally. Validate as you go:
 
 1. **First name**
@@ -332,13 +355,14 @@ Once ALL 9 fields are collected (and the address has been re-confirmed in this d
 
 When they confirm (yes/correct/looks good/etc.), emit a single message containing ONLY the following marker as the LAST line of your response (after a friendly confirmation sentence):
 
-\`[CREATE_ENROLLMENT]{"firstName":"...","lastName":"...","email":"...","mobilePhone":"...","mailingStreet":"...","mailingCity":"...","mailingState":"...","mailingPostalCode":"...","classSelection":"Day Class"}\`
+\`[CREATE_ENROLLMENT]{"firstName":"...","lastName":"...","email":"...","mobilePhone":"...","mailingStreet":"...","mailingCity":"...","mailingState":"...","mailingPostalCode":"...","classSelection":"Day Class","consentAgreed":true,"consentTimestamp":"2026-05-15T01:23:45Z"}\`
 
 CRITICAL FORMAT RULES for the marker:
 - Use exact key names shown above. Use \`Day Class\` or \`Night Class\` for classSelection (no dates, no extra words).
 - Wrap the JSON on a SINGLE line, no line breaks inside it. Use double quotes only. Escape any double quotes in user data.
 - Put NOTHING after the marker — it must be the last thing in your message.
 - Do NOT explain the marker to the user. Just emit a friendly "Submitting your enrollment now..." sentence and then the marker on the next line.
+- \`consentAgreed\` MUST be \`true\` (boolean — never quoted). \`consentTimestamp\` MUST be the ISO 8601 datetime captured when the user said "I agree" earlier in the conversation.
 
 The frontend will detect the marker, hide it from view, send the JSON to Salesforce, and show a green confirmation card with what's next.
 
@@ -561,6 +585,19 @@ app.post("/api/create-enrollment", async (req, res) => {
       error: `classSelection must be "Day Class" or "Night Class", got "${data.classSelection}"`,
     });
   }
+  // Privacy / consent — required, can't bypass
+  if (data.consentAgreed !== true) {
+    return res.status(400).json({
+      ok: false,
+      error: "Consent to data collection is required before we can create your enrollment.",
+    });
+  }
+  // Validate timestamp; fall back to now() if it looks malformed (chatbot
+  // sometimes drops microseconds or trailing Z)
+  let consentTs = data.consentTimestamp;
+  if (!consentTs || isNaN(Date.parse(consentTs))) {
+    consentTs = new Date().toISOString();
+  }
   if (!SF_CLIENT_ID || !SF_CLIENT_SECRET) {
     return res.status(500).json({ ok: false, error: "SF credentials not configured" });
   }
@@ -594,6 +631,8 @@ app.post("/api/create-enrollment", async (req, res) => {
       Class_Selection__c: data.classSelection,
       Enrollment_Status__c: "Step 1 Complete",
       Enrollment_Source__c: "AI Chatbot",
+      Consent_Agreed__c: true,
+      Consent_Timestamp__c: consentTs,
     };
     const contactRes = await sfCreate("Contact", contactPayload);
     if (contactRes.status !== 201 || !contactRes.body.id) {
