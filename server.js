@@ -260,7 +260,7 @@ When asked about class times, always cite these exact hours. Do NOT tell student
 
 ### College Credits
 - Students enroll through Foothill College
-- Eligible to receive 26 college credits toward a future Associate's or Bachelor's degree at Foothill College
+- Eligible to receive 27 college credits toward a future Associate's or Bachelor's degree at Foothill College
 
 ${classSection}
 
