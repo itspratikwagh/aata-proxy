@@ -212,14 +212,28 @@ async function buildSystemPrompt() {
   if (classes.length > 0) {
     classSection = "## UPCOMING CLASSES (LIVE DATA FROM SALESFORCE)\n";
     classes.forEach((c) => {
-      classSection += `\n### ${c.Name}\n`;
+      // Infer Day vs Night from class name (Salesforce naming convention:
+      // "...DAY" or "...NIGHT" suffix). Pre-compute schedule so the bot
+      // doesn't have to guess per-class.
+      const upper = (c.Name || "").toUpperCase();
+      let kind = "Class"; // default if name has neither marker
+      let schedule = "exact times available — ask AATA staff if needed";
+      if (upper.includes("DAY") && !upper.includes("MONDAY") && !upper.includes("FRIDAY")) {
+        kind = "Day Class";
+        schedule = "8:00 AM to 4:00 PM PST, Monday-Friday (~10 weeks)";
+      } else if (upper.includes("NIGHT")) {
+        kind = "Night Class";
+        schedule = "5:00 PM to 10:00 PM PST, Monday-Friday (~16 weeks)";
+      }
+      classSection += `\n### ${c.Name} [${kind}]\n`;
+      classSection += `- Schedule: ${schedule}\n`;
       classSection += `- Start Date: ${c.yClasses__First_Session_Date__c || "TBD"}\n`;
       classSection += `- End Date: ${c.yClasses__Last_Session_Date__c || "TBD"}\n`;
       classSection += `- Total Spots: ${c.Total_Spots__c || "N/A"}\n`;
       classSection += `- Enrolled: ${c.Enrollment_Count__c || 0}\n`;
       classSection += `- Spots Remaining: ${c.Spots_Remaining__c || "N/A"}\n`;
     });
-    classSection += "\nIMPORTANT: Spots are limited. Always mention how many spots are left to create urgency.\n";
+    classSection += "\nIMPORTANT: Always cite the Schedule line above for class times — never say \"TBD\" if the schedule is filled in. Spots are limited; always mention how many spots are left to create urgency.\n";
   } else {
     classSection = "## UPCOMING CLASSES\nClass schedule is being updated. Ask the student to email info@aatatraining.org for the latest class options.\n";
   }
