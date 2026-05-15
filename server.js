@@ -3,10 +3,88 @@ const cors = require("cors");
 const Anthropic = require("@anthropic-ai/sdk");
 
 const app = express();
+// Trust the Railway/Cloudflare proxy chain so req.ip resolves to the real
+// client IP (otherwise everything looks like Railway's edge).
+app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json({ limit: "50kb" }));
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// ============================================================
+// ABUSE PROTECTION — rate limits + email validation
+// ============================================================
+
+// In-memory sliding-window rate limiter. Resets on Railway restart, which
+// is fine for first-pass abuse — sustained abuse will still hit the limits
+// because Railway restarts are infrequent.
+const rateLimitBuckets = new Map(); // key = `${endpoint}:${ip}` → array of timestamps
+
+function rateLimit(req, res, opts) {
+  const ip = req.ip || req.headers["x-forwarded-for"] || "unknown";
+  const key = `${opts.endpoint}:${ip}`;
+  const now = Date.now();
+  const windowStart = now - opts.windowMs;
+
+  let timestamps = rateLimitBuckets.get(key) || [];
+  // Drop expired entries
+  timestamps = timestamps.filter((t) => t > windowStart);
+
+  if (timestamps.length >= opts.max) {
+    const retryAfterSec = Math.ceil((timestamps[0] + opts.windowMs - now) / 1000);
+    res.set("Retry-After", String(retryAfterSec));
+    res.status(429).json({
+      ok: false,
+      error: opts.message || `Rate limit exceeded. Try again in ${retryAfterSec}s.`,
+    });
+    console.log(`[RATE-LIMIT] ${key} blocked (${timestamps.length}/${opts.max} in ${opts.windowMs}ms)`);
+    return false;
+  }
+
+  timestamps.push(now);
+  rateLimitBuckets.set(key, timestamps);
+  // Periodic GC so the map doesn't grow unbounded
+  if (rateLimitBuckets.size > 5000) {
+    for (const [k, ts] of rateLimitBuckets) {
+      if (ts.every((t) => t < windowStart)) rateLimitBuckets.delete(k);
+    }
+  }
+  return true;
+}
+
+// Common disposable / throw-away email domains. Maintained list — extend as
+// abuse patterns emerge. Source: cross-referenced from public lists.
+const DISPOSABLE_EMAIL_DOMAINS = new Set([
+  "mailinator.com", "10minutemail.com", "10minutemail.net", "guerrillamail.com",
+  "guerrillamail.info", "guerrillamail.biz", "guerrillamail.org", "guerrillamail.de",
+  "sharklasers.com", "spam4.me", "tempr.email", "trashmail.com", "yopmail.com",
+  "throwawaymail.com", "maildrop.cc", "fakeinbox.com", "getnada.com",
+  "tempmail.com", "tempmail.net", "tempmailo.com", "tempinbox.com",
+  "mintemail.com", "anonbox.net", "burnermail.io", "moakt.com",
+  "discard.email", "emailondeck.com", "fakemail.net", "harakirimail.com",
+  "incognitomail.org", "inboxbear.com", "spambog.com", "mytemp.email",
+  "mt2015.com", "tempemail.com", "tmpeml.com", "dropmail.me",
+]);
+
+function looksDisposableEmail(email) {
+  const at = email.toLowerCase().lastIndexOf("@");
+  if (at === -1) return false;
+  const domain = email.slice(at + 1).trim();
+  return DISPOSABLE_EMAIL_DOMAINS.has(domain);
+}
+
+function looksFakeName(s) {
+  if (!s || typeof s !== "string") return true;
+  const trimmed = s.trim();
+  // Empty, single character, all whitespace, or all-numeric
+  if (trimmed.length < 2) return true;
+  if (/^\d+$/.test(trimmed)) return true;
+  // Repeated single character: "aaaa", "xxx"
+  if (/^(.)\1+$/.test(trimmed)) return true;
+  // Obvious test/spam strings
+  if (/^(test|asdf|qwerty|abc|xyz|spam|fake)+$/i.test(trimmed)) return true;
+  return false;
+}
 
 // ============================================================
 // GOOGLE SHEET CONFIG (optional dynamic overrides)
@@ -391,6 +469,13 @@ If a student asks to speak with a person, be connected to an agent, or wants to 
 // CHAT ENDPOINT
 // ============================================================
 app.post("/api/chat", async (req, res) => {
+  // 60 chat turns per IP per hour. Real student conversations are 15–25
+  // turns, so 60 is generous for one student but blocks scripted spam.
+  if (!rateLimit(req, res, {
+    endpoint: "chat", windowMs: 60 * 60 * 1000, max: 60,
+    message: "You're sending messages a bit too fast. Please wait a minute and try again.",
+  })) return;
+
   try {
     const { messages } = req.body;
     if (!messages || !Array.isArray(messages)) {
@@ -440,6 +525,14 @@ async function sfCreate(sObject, payload) {
 }
 
 app.post("/api/create-enrollment", async (req, res) => {
+  // Hard cap: 3 enrollments per IP per 24h. Genuine students enroll ONCE.
+  // This is the most expensive endpoint (writes a Contact + Class
+  // Registration + fires Box Sign + 2 future emails), so guard it tightly.
+  if (!rateLimit(req, res, {
+    endpoint: "create-enrollment", windowMs: 24 * 60 * 60 * 1000, max: 3,
+    message: "We've already received an enrollment from this device today. If you need to fix something, email info@aatatraining.org.",
+  })) return;
+
   const REQUIRED = [
     "firstName", "lastName", "email", "mobilePhone",
     "mailingStreet", "mailingCity", "mailingState", "mailingPostalCode",
@@ -450,8 +543,17 @@ app.post("/api/create-enrollment", async (req, res) => {
   if (missing.length) {
     return res.status(400).json({ ok: false, error: "Missing required fields", missing });
   }
-  if (!String(data.email).includes("@")) {
-    return res.status(400).json({ ok: false, error: "Invalid email" });
+  // Email format + disposable-domain check
+  const email = String(data.email).trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ ok: false, error: "That email address doesn't look right. Please use a valid email." });
+  }
+  if (looksDisposableEmail(email)) {
+    return res.status(400).json({ ok: false, error: "Please use a real, non-temporary email address — we'll be sending your DAS form, Foothill instructions, and book payment details there." });
+  }
+  // Reject obviously-fake names
+  if (looksFakeName(data.firstName) || looksFakeName(data.lastName)) {
+    return res.status(400).json({ ok: false, error: "Please enter your real first and last name." });
   }
   if (!["Day Class", "Night Class"].includes(data.classSelection)) {
     return res.status(400).json({
@@ -530,6 +632,13 @@ app.post("/api/create-enrollment", async (req, res) => {
 // endpoint with the FORCE_RESEND trigger.
 // ============================================================
 app.post("/api/resend-enrollment-emails", async (req, res) => {
+  // 5 resends per IP per hour. Real students need 1, maybe 2 if first
+  // batch hits spam. More than that = abuse.
+  if (!rateLimit(req, res, {
+    endpoint: "resend", windowMs: 60 * 60 * 1000, max: 5,
+    message: "Too many resend attempts. Please email info@aatatraining.org for help.",
+  })) return;
+
   const email = (req.body && req.body.email || "").trim();
   if (!email || !email.includes("@")) {
     return res.status(400).json({ ok: false, error: "Valid email is required" });
@@ -642,15 +751,80 @@ app.get("/api/available-classes", async (req, res) => {
   }
 });
 
+// /health — actively probes every dependency and returns 200 only if
+// EVERYTHING is working. External uptime monitors (UptimeRobot, Better
+// Uptime, etc.) should ping this every 5 min and alert on non-200.
 app.get("/health", async (req, res) => {
-  const sheet = await fetchGoogleSheet();
-  const sfConnected = !!(SF_CLIENT_ID && SF_CLIENT_SECRET);
-  res.json({
+  const result = {
     status: "ok",
-    sheetEntries: Object.keys(sheet).length,
-    salesforceConnected: sfConnected,
-    cachedClasses: cachedClassData.length,
-  });
+    timestamp: new Date().toISOString(),
+    checks: {},
+  };
+
+  // 1. Anthropic key present
+  result.checks.anthropic_key = process.env.ANTHROPIC_API_KEY ? "ok" : "MISSING";
+  if (!process.env.ANTHROPIC_API_KEY) result.status = "degraded";
+
+  // 2. Salesforce — actually try to auth and run a trivial query
+  try {
+    if (!SF_CLIENT_ID || !SF_CLIENT_SECRET) throw new Error("SF credentials env vars missing");
+    const r = await sfQuery("SELECT Id FROM Contact LIMIT 1");
+    if (r.errorCode) throw new Error(r.message || r.errorCode);
+    result.checks.salesforce = "ok";
+  } catch (err) {
+    result.checks.salesforce = "FAIL: " + err.message;
+    result.status = "degraded";
+  }
+
+  // 3. Salesforce class data fresh
+  try {
+    const classes = await fetchSalesforceClasses();
+    result.checks.open_classes = `${classes.length} open`;
+    if (classes.length === 0) {
+      result.checks.open_classes += " (warning: 0 classes available for enrollment)";
+    }
+  } catch (err) {
+    result.checks.open_classes = "FAIL: " + err.message;
+    result.status = "degraded";
+  }
+
+  // 4. Google Sheet reachable (config overrides)
+  try {
+    const sheet = await fetchGoogleSheet();
+    result.checks.google_sheet = `${Object.keys(sheet).length} entries`;
+  } catch (err) {
+    result.checks.google_sheet = "FAIL: " + err.message;
+    result.status = "degraded";
+  }
+
+  // 5. SF Apex webhook endpoint reachable (the canonical email-trigger path)
+  try {
+    const probe = await fetch(
+      "https://americanaerospacetechnicalacademy.my.salesforce-sites.com/services/apexrest/boxsign/webhook",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ trigger: "FORCE_RESEND" }), // missing email → handler returns 400 which proves it's alive
+      }
+    );
+    if (probe.status === 400 || probe.status === 200) {
+      result.checks.sf_webhook = "ok";
+    } else {
+      result.checks.sf_webhook = `unexpected status ${probe.status}`;
+      result.status = "degraded";
+    }
+  } catch (err) {
+    result.checks.sf_webhook = "FAIL: " + err.message;
+    result.status = "degraded";
+  }
+
+  res.status(result.status === "ok" ? 200 : 503).json(result);
+});
+
+// /health/quick — fast, no external calls. For Railway's own
+// container health checks (don't want them hammering SF/Box every 30s).
+app.get("/health/quick", (req, res) => {
+  res.status(200).json({ status: "ok", uptime_sec: Math.floor(process.uptime()) });
 });
 
 const PORT = process.env.PORT || 3000;
