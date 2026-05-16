@@ -807,6 +807,177 @@ app.get("/api/available-classes", async (req, res) => {
 // /health — actively probes every dependency and returns 200 only if
 // EVERYTHING is working. External uptime monitors (UptimeRobot, Better
 // Uptime, etc.) should ping this every 5 min and alert on non-200.
+// ============================================================
+// STAFF QUERY — internal AATA staff Q&A bot, READ-ONLY against Salesforce.
+// Two-pass:
+//   1. Claude translates the natural-language question into SOQL
+//   2. Backend validates (SELECT-only, no DML keywords) + executes
+//   3. Claude formats results back into plain English
+// Auth: shared PIN sent in body. Rate-limited per IP.
+// ============================================================
+const STAFF_PIN = process.env.STAFF_PIN || "AATA2026";
+
+const SOQL_SCHEMA_HINT = `
+Available Salesforce objects and their queryable fields. Use ONLY these fields and objects.
+
+### Contact (the student record)
+Standard: Id, FirstName, LastName, Name, Email, MobilePhone, Phone, Birthdate,
+MailingStreet, MailingCity, MailingState, MailingPostalCode, AccountId, Account.Name,
+CreatedDate, LastModifiedDate
+Custom: Enrollment_Status__c (picklist: "Step 1 Complete", "DAS Sent", "DAS Signed",
+"Emails Sent", "Payment Received", "Fully Enrolled"), Enrollment_Source__c,
+Class_Selection__c, Class__c (lookup to yClasses__Class__c, use Class__r.Name),
+Class_Registration__c, SSN__c (text), SSN_Last_Four__c (number),
+DAS_Signed_Date__c (date), DAS_Signature__c, DAS_Execution_Date__c,
+Box_Sign_Request_ID__c, Foothill_CWID__c, Received_Book_Fees__c (currency),
+Highest_Education__c, Military_Service__c, Years_Employed__c, Number_of_Dependents__c,
+Ethnicity__c, Gender__c, Vet_Status__c, Employment_Status__c, Funder__c (lookup),
+Self_Funded__c, Student_Status__c, County_of_Residence__c, Consent_Agreed__c,
+Consent_Timestamp__c, Typed_Signature__c, Class_Interest__c
+
+### yClasses__Class__c (a single class cohort)
+Id, Name, yClasses__First_Session_Date__c, yClasses__Last_Session_Date__c,
+Total_Spots__c, Enrollment_Count__c, Spots_Remaining__c, Registration_Open__c,
+CreatedDate
+
+### yClasses__Class_Registration__c (links a Contact to a Class)
+Id, yClasses__Student__c (Contact lookup, use Student__r.Name),
+yClasses__Class__c (Class lookup, use Class__r.Name),
+yClasses__Grade__c, CreatedDate
+
+### yClasses__Attendance__c (per-session attendance record)
+Id, yClasses__Class_Registration__c (lookup),
+yClasses__Class_Session__c (lookup), yClasses__Status__c (picklist: Attended/Late/Excused/No Show/Early Release/Not Scheduled),
+yClasses__Date__c, CreatedDate
+`;
+
+app.post("/api/staff-query", async (req, res) => {
+  // Rate limit — 40 staff queries per IP per hour
+  if (!rateLimit(req, res, {
+    endpoint: "staff", windowMs: 60 * 60 * 1000, max: 40,
+    message: "Hold up — too many queries in the last hour. Try again in a bit.",
+  })) return;
+
+  const { question, pin } = req.body || {};
+  if (pin !== STAFF_PIN) {
+    return res.status(401).json({ ok: false, error: "Invalid staff PIN" });
+  }
+  if (!question || String(question).trim().length < 3) {
+    return res.status(400).json({ ok: false, error: "Question is required" });
+  }
+  if (!SF_CLIENT_ID || !SF_CLIENT_SECRET) {
+    return res.status(500).json({ ok: false, error: "SF credentials not configured" });
+  }
+
+  // STEP 1: Claude generates SOQL
+  let soql;
+  try {
+    const r1 = await client.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 600,
+      system: `You translate AATA staff questions into Salesforce SOQL SELECT queries.
+
+OUTPUT RULES (strict):
+- Output ONLY a single SOQL statement starting with SELECT.
+- No explanation, no comments, no code fences, no markdown, no trailing semicolon.
+- Default LIMIT 50 unless the user asks for "all" (then up to 200) or for a count (use COUNT()).
+- For date filters use SOQL date literals: TODAY, YESTERDAY, LAST_N_DAYS:N, THIS_WEEK, THIS_MONTH, THIS_YEAR.
+- For COUNT queries use the form: SELECT COUNT() FROM Contact WHERE ...
+- For aggregates (group by status, etc.) use the form: SELECT Enrollment_Status__c, COUNT(Id) FROM Contact GROUP BY Enrollment_Status__c
+- Use relationship dot notation for parent fields (e.g., Class__r.Name).
+- For child relationships use subqueries.
+- If the user asks something that requires writing/changing data, output exactly: SELECT 'CANNOT_MODIFY' FROM Contact LIMIT 1
+${SOQL_SCHEMA_HINT}`,
+      messages: [{ role: "user", content: String(question) }],
+    });
+    soql = r1.content?.[0]?.text?.trim() || "";
+  } catch (err) {
+    console.error("Staff SOQL gen failed:", err.message);
+    return res.status(500).json({ ok: false, error: "Could not generate query: " + err.message });
+  }
+
+  // Strip any code fences Claude might have added despite instructions
+  soql = soql.replace(/^```(?:sql|soql)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  // Strip trailing semicolon if any
+  soql = soql.replace(/;\s*$/, "").trim();
+
+  // SECURITY GUARDRAILS
+  if (!/^\s*SELECT\s/i.test(soql)) {
+    return res.json({
+      ok: true,
+      answer: "I can only run read-only queries — try rephrasing as a question (e.g., 'how many...' or 'show me...').",
+      soql,
+    });
+  }
+  if (/\b(UPDATE|INSERT|DELETE|UPSERT|MERGE|CREATE|DROP|ALTER|TRUNCATE|EXEC|EXECUTE)\b/i.test(soql)) {
+    return res.json({
+      ok: true,
+      answer: "Read-only access only — I can't modify Salesforce data. If you need to make a change, do it directly in SF.",
+      soql,
+    });
+  }
+  if (soql.includes("CANNOT_MODIFY")) {
+    return res.json({
+      ok: true,
+      answer: "That request would require modifying data, which this read-only assistant can't do. Please make the change directly in Salesforce.",
+    });
+  }
+
+  // EXECUTE
+  let results;
+  try {
+    results = await sfQuery(soql);
+    // sfQuery returns either {records: [...]} or an error array/object
+    if (Array.isArray(results) && results[0]?.errorCode) {
+      return res.json({
+        ok: true,
+        answer: `The query failed in Salesforce:\n\n**${results[0].errorCode}**: ${results[0].message}\n\n_Generated SOQL:_ \`${soql}\`\n\nTry rephrasing your question and I'll regenerate the query.`,
+        soql,
+      });
+    }
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: "Salesforce query failed: " + err.message, soql });
+  }
+
+  // STEP 2: Claude formats the results into plain English
+  const resultsTrunc = JSON.stringify(results).slice(0, 12000);
+  let answer;
+  try {
+    const r2 = await client.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 1500,
+      system: `You are an internal AATA staff data assistant. The user asked a question about Salesforce data and you've already retrieved the answer (the query has already run — you don't need to run it). Format the results in clean plain English.
+
+Style:
+- Be concise. No filler ("Great question!" etc.).
+- Use markdown tables when listing multiple records with multiple fields.
+- Use bullet lists for short item lists.
+- For COUNT queries, just state the number plainly.
+- For aggregate queries (GROUP BY), show as a table.
+- Format dates as "Aug 3, 2026" not ISO strings.
+- Format currency with $.
+- If the result set is empty, say "No matching records." plainly.
+- If you display SSN or other sensitive data, ALWAYS preface with: "⚠️ Sensitive data — handle with care:"
+- At the very end (small, italic, on its own line), add: "_Source: Salesforce live query_"`,
+      messages: [{
+        role: "user",
+        content: `Question: ${question}\n\nSOQL that ran: \`${soql}\`\n\nSF result (JSON, may be truncated):\n${resultsTrunc}`,
+      }],
+    });
+    answer = r2.content?.[0]?.text || "(no response)";
+  } catch (err) {
+    console.error("Staff format failed:", err.message);
+    return res.status(500).json({ ok: false, error: "Could not format response: " + err.message });
+  }
+
+  res.json({
+    ok: true,
+    answer,
+    soql,
+    recordCount: (results.records || []).length,
+  });
+});
+
 app.get("/health", async (req, res) => {
   const result = {
     status: "ok",
