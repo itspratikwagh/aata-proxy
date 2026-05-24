@@ -281,7 +281,7 @@ ${classSection}
 ## TUITION & COSTS
 - **California Residents**: The full $7,495 tuition is **covered by the State of California** through its registered apprenticeship funding program. California has a state-level priority to grow skilled-trade apprenticeships in industries facing worker shortages (NDT/aerospace is one of those priority industries), so the state pays AATA-Foothill directly to train qualified California apprentices. **This is government-funded apprenticeship money, not a discount AATA gives out** — it's why the program is free.
   - **Residency requirement**: To qualify, the student must have been a California resident for at least the past 1 year. If they recently moved to California (less than ~1 year), explain they may not be eligible yet and direct them to leave a message at https://www.aatatraining.org/apply so AATA staff can advise on alternatives.
-- **Texas Residents**: Similar funding available through Texas — contact Patrick Kratochvil
+- **Texas Residents**: The Texas program is funded by the **Texas Workforce Commission** (Chapter 133 grant), administered through **Houston Community College**. Tuition, books, and supplies are all covered. Patrick Kratochvil is the local coordinator — when a TX prospect says they want to enroll, capture their basic info via the TX lead flow (see ENROLLMENT FLOW step 2b) then send them to Patrick's intake form.
 - Only additional cost: ${get("book_fee", "$325")} book fee for ASNT books (brand new hard copies shipped directly from ASNT to student's home via FedEx)
 - Book fee can be paid in one installment OR split into two equal payments (${get("book_split", "$162.50 each")})
 - **Out-of-State Residents**: Funding is handled on a case-by-case basis. Direct them to leave a message at https://www.aatatraining.org/apply
@@ -452,7 +452,7 @@ When a student says they want to enroll or are ready to sign up:
 1. First, ask: "Which state do you currently reside in?"
 2. Based on their answer:
    - California resident → Continue to step 2a (residency duration check)
-   - Texas resident → Direct them to contact Patrick Kratochvil at ${get("phone_tx", "(281) 676-0356")} or ${get("email_tx", "patrickaata@gmail.com")} for enrollment
+   - **Texas resident → Continue to step 2b (TX lead capture)**
    - Out-of-state resident → Explain funding is handled case by case, direct them to leave a message at https://www.aatatraining.org/apply
 
 2a. **For California residents only — residency duration check (BEFORE collecting the 9 fields):**
@@ -463,6 +463,32 @@ When a student says they want to enroll or are ready to sign up:
 
 3. For eligible CA residents: collect the 9 fields one by one, confirm, then emit the [CREATE_ENROLLMENT] marker
 4. After the marker is emitted, set expectations about the auto-emails (DAS in 1-2 min, then 2 auto-emails after they sign) — no more manual steps
+
+2b. **For Texas residents — capture lead + direct to Patrick's intake form:**
+   The Texas program is funded through the Texas Workforce Commission and administered with **Patrick Kratochvil** as the local coordinator. Patrick uses a Google Form to collect the full AIMS intake. Your job is to capture the basic contact info into Salesforce first, then hand them off to Patrick's form.
+
+   **Tell them warmly:** "The Texas program is fully funded through the Texas Workforce Commission — tuition, books, and supplies are all covered, and the program runs through Houston Community College. Patrick Kratochvil handles Texas enrollment. Let me capture your details so Patrick has a record of you, then I'll send you to his intake form."
+
+   **Then walk through the privacy disclosure** (the same "Quick heads-up" block CA uses — show it verbatim, no preamble). Wait for "I agree" or equivalent affirmative.
+
+   **After consent, collect EXACTLY 4 fields one by one** (don't ask all at once):
+   - First name
+   - Last name
+   - Email
+   - Mobile phone
+
+   **Confirm them all back briefly** ("Got it — Jane Doe, jane@example.com, 555-1234. Saving now…").
+
+   **Then emit the [CREATE_TX_LEAD] marker with this JSON shape** (no preamble, no extra text after the marker):
+
+   \`[CREATE_TX_LEAD]{"firstName":"...","lastName":"...","email":"...","mobilePhone":"...","consentAgreed":true,"consentTimestamp":"2026-05-22T18:30:00Z"}\`
+
+   - \`consentAgreed\` MUST be \`true\` (boolean, not quoted)
+   - \`consentTimestamp\` MUST be the ISO 8601 datetime of when they said "I agree"
+   - Do NOT include any other fields
+   - Do NOT add any text after the marker — the chatbot frontend renders the success card (with Patrick's form link) automatically
+
+   After the marker fires, the frontend shows them the Google Form link + Patrick's contact info. You do NOT need to repeat the form link in chat — the success card has it.
 
 IMPORTANT RULES ABOUT VETERANS:
 - Do NOT ask if someone is a veteran as a qualifying question
@@ -560,6 +586,33 @@ async function sfCreate(sObject, payload) {
     });
   }
   return { status: res.status, body: await res.json() };
+}
+
+// PATCH an existing SObject by Id. Returns {status} — SF returns 204
+// (no content) on success, no body. Used for find-or-create patterns
+// where a contact may already exist from a prior chatbot session.
+async function sfUpdate(sObject, id, payload) {
+  if (!sfAuth.access_token) await sfAuthenticate();
+  const url = `${sfAuth.instance_url}/services/data/v59.0/sobjects/${sObject}/${id}`;
+  const doPatch = () => fetch(url, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${sfAuth.access_token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  let res = await doPatch();
+  if (res.status === 401) {
+    await sfAuthenticate();
+    res = await doPatch();
+  }
+  // 204 = success (empty body). 200 with body in some cases. Anything
+  // else is an error and the body has the SF error message.
+  if (res.status === 204) return { status: 204, body: null };
+  let body = null;
+  try { body = await res.json(); } catch (e) { body = null; }
+  return { status: res.status, body };
 }
 
 app.post("/api/create-enrollment", async (req, res) => {
@@ -675,6 +728,113 @@ app.post("/api/create-enrollment", async (req, res) => {
     });
   } catch (err) {
     console.error("Create enrollment error:", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ============================================================
+// CREATE TX LEAD — captures interested Texas prospects in SF as a
+// Contact stub, then the chatbot directs them to Patrick's Google
+// Form for the full AIMS intake. Much lighter than /api/create-
+// enrollment (no class registration, no Box Sign, no Foothill flow)
+// because Patrick's existing Google Form workflow handles the deep
+// intake. We just want SF visibility into who started.
+// ============================================================
+app.post("/api/create-tx-lead", async (req, res) => {
+  // Same hard cap as CA: 3 leads per IP per 24h. Patrick's form has its
+  // own anti-abuse; this just guards the chatbot from spam loops.
+  if (!rateLimit(req, res, {
+    endpoint: "create-tx-lead",
+    windowMs: 24 * 60 * 60 * 1000,
+    max: 3,
+    message: "We've already captured your details today. If you need to update something, email info@aatatraining.org or call Patrick at (281) 676-0356.",
+  })) return;
+
+  const REQUIRED = ["firstName", "lastName", "email", "mobilePhone"];
+  const data = req.body || {};
+  const missing = REQUIRED.filter((k) => !data[k] || String(data[k]).trim() === "");
+  if (missing.length) {
+    return res.status(400).json({ ok: false, error: "Missing required fields", missing });
+  }
+
+  const email = String(data.email).trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ ok: false, error: "That email address doesn't look right. Please use a valid email." });
+  }
+  if (looksDisposableEmail(email)) {
+    return res.status(400).json({ ok: false, error: "Please use a real, non-temporary email address — Patrick will follow up there." });
+  }
+  if (looksFakeName(data.firstName) || looksFakeName(data.lastName)) {
+    return res.status(400).json({ ok: false, error: "Please enter your real first and last name." });
+  }
+
+  // Consent is collected the same way as CA — student must have agreed
+  // before we capture anything. Timestamp is for the audit trail.
+  if (data.consentAgreed !== true) {
+    return res.status(400).json({
+      ok: false,
+      error: "Consent to data collection is required before we can save your details.",
+    });
+  }
+  let consentTs = data.consentTimestamp;
+  if (!consentTs || isNaN(Date.parse(consentTs))) {
+    consentTs = new Date().toISOString();
+  }
+
+  if (!SF_CLIENT_ID || !SF_CLIENT_SECRET) {
+    return res.status(500).json({ ok: false, error: "SF credentials not configured" });
+  }
+
+  try {
+    // Find-or-create by email — if a TX prospect chats twice, we update
+    // their existing record rather than creating a duplicate.
+    const existing = await sfQuery(
+      `SELECT Id FROM Contact WHERE Email = '${email.replace(/'/g, "\\'")}' LIMIT 1`
+    );
+    const existingId = (existing.records || [])[0]?.Id || null;
+
+    const contactPayload = {
+      FirstName: data.firstName,
+      LastName: data.lastName,
+      Email: email,
+      MobilePhone: data.mobilePhone,
+      Phone: data.mobilePhone,
+      Program_Track__c: "Texas",
+      TX_Stage__c: "Intake Complete",
+      Enrollment_Source__c: "AI Chatbot",
+      Consent_Agreed__c: true,
+      Consent_Timestamp__c: consentTs,
+    };
+
+    let contactId;
+    if (existingId) {
+      const updateRes = await sfUpdate("Contact", existingId, contactPayload);
+      if (updateRes.status !== 204) {
+        console.error("TX lead contact update failed:", updateRes.body);
+        return res.status(500).json({ ok: false, error: "Contact update failed", details: updateRes.body });
+      }
+      contactId = existingId;
+      console.log("Updated TX lead Contact:", contactId, "for", email);
+    } else {
+      const createRes = await sfCreate("Contact", contactPayload);
+      if (createRes.status !== 201 || !createRes.body.id) {
+        console.error("TX lead contact create failed:", createRes.body);
+        return res.status(500).json({ ok: false, error: "Contact create failed", details: createRes.body });
+      }
+      contactId = createRes.body.id;
+      console.log("Created TX lead Contact:", contactId, "for", email);
+    }
+
+    res.json({
+      ok: true,
+      contactId,
+      googleFormUrl: "https://docs.google.com/forms/d/e/1FAIpQLSfJPnbKq-LCMA9fcbFUHNS0ii8ppDfRaUWE2mQQUIBSiVs6Mg/viewform",
+      patrickPhone: "(281) 676-0356",
+      patrickEmail: "patrickaata@gmail.com",
+      message: "Your details are saved. Patrick will follow up after you submit the intake form.",
+    });
+  } catch (err) {
+    console.error("Create TX lead error:", err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
