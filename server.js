@@ -637,6 +637,130 @@ async function sfUpdate(sObject, id, payload) {
   return { status: res.status, body };
 }
 
+// PATCH upsert by External ID — creates if not exists, updates if exists.
+// SF returns 201 on create, 204 on update. Used for chatbot conversation logging
+// where the client owns the Session_Id__c key.
+async function sfUpsertByExternalId(sObject, externalIdField, externalIdValue, payload) {
+  if (!sfAuth.access_token) await sfAuthenticate();
+  const url = `${sfAuth.instance_url}/services/data/v59.0/sobjects/${sObject}/${externalIdField}/${encodeURIComponent(externalIdValue)}`;
+  const doPatch = () => fetch(url, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${sfAuth.access_token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  let res = await doPatch();
+  if (res.status === 401) {
+    await sfAuthenticate();
+    res = await doPatch();
+  }
+  let body = null;
+  try { body = await res.json(); } catch (e) { body = null; }
+  return { status: res.status, body };
+}
+
+// ============================================================
+// CHATBOT CONVERSATION LOGGING
+// Upserts a Chatbot_Conversation__c record keyed by Session_Id__c.
+// Designed to be called repeatedly during a session (debounced ~30s) and
+// once more on page unload (via navigator.sendBeacon, which doesn't read
+// the response). We always respond fast and never block the client.
+// ============================================================
+const TRANSCRIPT_MAX_CHARS = 131000; // SF LongTextArea cap is 131072
+const MSG_MAX_CHARS = 32000;          // Last_User/Bot_Message__c cap is 32768
+
+function clampStr(s, max) {
+  if (!s) return null;
+  s = String(s);
+  if (s.length <= max) return s;
+  // Keep the tail — most recent content is most useful
+  return "…[truncated]…\n" + s.slice(s.length - max + 20);
+}
+
+app.post("/api/log-conversation", express.json({ limit: "1mb" }), async (req, res) => {
+  // Respond immediately — this endpoint must be best-effort. sendBeacon
+  // requests don't read the response and a slow SF write shouldn't slow
+  // the user's page unload.
+  res.status(202).json({ ok: true });
+
+  try {
+    if (!SF_CLIENT_ID || !SF_CLIENT_SECRET) return;
+
+    const b = req.body || {};
+    const sessionId = String(b.sessionId || "").trim();
+    if (!sessionId || sessionId.length > 64) {
+      console.warn("[log-conversation] invalid sessionId:", sessionId);
+      return;
+    }
+
+    // Build transcript text. Accept either an array of {role, content}
+    // messages or a pre-formatted string.
+    let transcriptText = "";
+    if (Array.isArray(b.transcript)) {
+      transcriptText = b.transcript
+        .map((m) => {
+          if (!m || !m.role) return "";
+          const role = m.role === "assistant" ? "BOT" : m.role === "user" ? "USER" : String(m.role).toUpperCase();
+          const ts = m.ts ? `[${m.ts}] ` : "";
+          const content = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+          return `${ts}${role}: ${content}`;
+        })
+        .filter(Boolean)
+        .join("\n\n");
+    } else if (typeof b.transcript === "string") {
+      transcriptText = b.transcript;
+    }
+
+    // Derive last user / last bot messages from the transcript array for
+    // easier scanning in SF list views.
+    let lastUserMsg = null;
+    let lastBotMsg = null;
+    if (Array.isArray(b.transcript)) {
+      for (let i = b.transcript.length - 1; i >= 0; i--) {
+        const m = b.transcript[i];
+        if (!m) continue;
+        const c = typeof m.content === "string" ? m.content : "";
+        if (!lastUserMsg && m.role === "user") lastUserMsg = c;
+        if (!lastBotMsg && m.role === "assistant") lastBotMsg = c;
+        if (lastUserMsg && lastBotMsg) break;
+      }
+    }
+
+    const msgCount = Array.isArray(b.transcript) ? b.transcript.length : (b.messageCount || 0);
+
+    const payload = {
+      Started_At__c: b.startedAt || new Date().toISOString(),
+      Last_Activity_At__c: new Date().toISOString(),
+      Ended__c: Boolean(b.ended),
+      Message_Count__c: msgCount,
+      Transcript__c: clampStr(transcriptText, TRANSCRIPT_MAX_CHARS),
+      Last_User_Message__c: clampStr(lastUserMsg, MSG_MAX_CHARS),
+      Last_Bot_Message__c: clampStr(lastBotMsg, MSG_MAX_CHARS),
+      Source__c: clampStr(b.source || "chatbot-embed", 80),
+      User_Agent__c: clampStr(req.headers["user-agent"] || "", 255),
+      Page_URL__c: clampStr(b.pageUrl || "", 255),
+    };
+    if (b.email)       payload.Email__c       = clampStr(b.email, 80);
+    if (b.firstName)   payload.First_Name__c  = clampStr(b.firstName, 80);
+    if (b.lastName)    payload.Last_Name__c   = clampStr(b.lastName, 80);
+    if (b.phone)       payload.Phone__c       = clampStr(b.phone, 40);
+    if (b.track)       payload.Track__c       = b.track;
+    if (b.contactId)   payload.Contact__c     = b.contactId;
+    if (b.enrollmentCreated) payload.Enrollment_Created__c = true;
+
+    const result = await sfUpsertByExternalId(
+      "Chatbot_Conversation__c", "Session_Id__c", sessionId, payload
+    );
+    if (result.status >= 400) {
+      console.error("[log-conversation] SF upsert failed:", result.status, JSON.stringify(result.body).slice(0, 400));
+    }
+  } catch (err) {
+    console.error("[log-conversation] error:", err.message);
+  }
+});
+
 app.post("/api/create-enrollment", async (req, res) => {
   // Hard cap: 3 enrollments per IP per 24h. Genuine students enroll ONCE.
   // This is the most expensive endpoint (writes a Contact + Class
