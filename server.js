@@ -185,10 +185,18 @@ async function fetchSalesforceClasses() {
     return cachedClassData;
   }
   try {
+    // CRITICAL: filter to CA-track classes only. The chatbot only shows CA
+    // class options to students — TX runs through Patrick's separate flow
+    // (Google Form / /api/create-tx-lead). Without this filter, any
+    // Registration_Open Texas class would show up in the live class
+    // availability list and could match the CA enrollment SOQL below.
+    // Treat Program_Track__c = null as California for back-compat with
+    // existing class records that pre-date the Program_Track field.
     const soql =
       "SELECT Name, yClasses__First_Session_Date__c, yClasses__Last_Session_Date__c, " +
       "Total_Spots__c, Enrollment_Count__c, Spots_Remaining__c, Registration_Open__c " +
       "FROM yClasses__Class__c WHERE Registration_Open__c = true " +
+      "AND (Program_Track__c = 'California' OR Program_Track__c = null) " +
       "ORDER BY yClasses__First_Session_Date__c ASC";
     const result = await sfQuery(soql);
     cachedClassData = result.records || [];
@@ -688,7 +696,14 @@ app.post("/api/create-enrollment", async (req, res) => {
     const classFilter = data.classSelection === "Day Class" ? "DAY" : "NIGHT";
     const classQuery = await sfQuery(
       `SELECT Id, Name, yClasses__First_Session_Date__c, Spots_Remaining__c ` +
-      `FROM yClasses__Class__c WHERE Registration_Open__c = true AND Name LIKE '%${classFilter}%' ` +
+      // Filter to California track ONLY. Without this filter, if anyone ever
+      // creates a Texas-track class with "DAY" or "NIGHT" in the name and
+      // Registration_Open=true, the CA enrollment flow will silently match
+      // it and create the Class Registration against the wrong class. Treat
+      // null as CA for back-compat (existing CA classes pre-date the field).
+      `FROM yClasses__Class__c WHERE Registration_Open__c = true ` +
+      `AND (Program_Track__c = 'California' OR Program_Track__c = null) ` +
+      `AND Name LIKE '%${classFilter}%' ` +
       `ORDER BY yClasses__First_Session_Date__c ASC LIMIT 1`
     );
     const matchedClass = (classQuery.records || [])[0];
