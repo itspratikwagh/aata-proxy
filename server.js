@@ -714,7 +714,11 @@ app.post("/api/create-enrollment", async (req, res) => {
       });
     }
 
-    // 2. Create the Contact (Apex trigger fires Box Sign on insert)
+    // 2. Create the Contact (Apex trigger fires Box Sign on insert).
+    // RecordTypeId is the AATA "Student" record type — without explicitly
+    // setting this, NPSP defaults Contacts to "Supporter" (a donor record
+    // type) which is wrong for enrollees and made every chatbot Contact
+    // look like a donor in list views and reports.
     const contactPayload = {
       FirstName: data.firstName,
       LastName: data.lastName,
@@ -729,6 +733,7 @@ app.post("/api/create-enrollment", async (req, res) => {
       Enrollment_Source__c: "AI Chatbot",
       Consent_Agreed__c: true,
       Consent_Timestamp__c: consentTs,
+      RecordTypeId: "0125Y000001OLx7QAG",  // Contact.Student
     };
     const contactRes = await sfCreate("Contact", contactPayload);
     if (contactRes.status !== 201 || !contactRes.body.id) {
@@ -833,6 +838,7 @@ app.post("/api/create-tx-lead", async (req, res) => {
       Enrollment_Source__c: "AI Chatbot",
       Consent_Agreed__c: true,
       Consent_Timestamp__c: consentTs,
+      RecordTypeId: "0125Y000001OLx7QAG",  // Contact.Student — same as CA path
     };
 
     let contactId;
