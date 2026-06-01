@@ -7,6 +7,10 @@ const app = express();
 // client IP (otherwise everything looks like Railway's edge).
 app.set("trust proxy", 1);
 app.use(cors());
+// Conversation-log payloads can be much larger than other writes (full
+// transcript), so mount their parser FIRST with a larger limit. Express
+// only parses the body once — whichever parser matches first wins.
+app.use("/api/log-conversation", express.json({ limit: "2mb" }));
 app.use(express.json({ limit: "50kb" }));
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -679,7 +683,8 @@ function clampStr(s, max) {
   return "…[truncated]…\n" + s.slice(s.length - max + 20);
 }
 
-app.post("/api/log-conversation", express.json({ limit: "1mb" }), async (req, res) => {
+app.post("/api/log-conversation", async (req, res) => {
+  // Body parser for this path is mounted earlier with a 2mb cap.
   // Respond immediately — this endpoint must be best-effort. sendBeacon
   // requests don't read the response and a slow SF write shouldn't slow
   // the user's page unload.
