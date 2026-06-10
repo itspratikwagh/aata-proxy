@@ -1297,6 +1297,188 @@ Rules: answer what they asked using ONLY the context given; if you don't know, s
 });
 
 // ============================================================
+// PAYMENT LOGGING — called by the Mac-side iMessage scanner.
+// Auth: X-AATA-Secret. Matches a payment text (Zelle/Apple Cash/
+// PayPal/CashApp) to a student Contact, accumulates
+// Received_Book_Fees__c, Chatters an audit note, sends an
+// acknowledgment email, and flips status at >= $325.
+// Unmatched/ambiguous payments trigger a review email to info@.
+// ============================================================
+const BOOK_FEE_TOTAL = 325;
+
+function normPhone(s) {
+  const d = String(s || "").replace(/\D/g, "");
+  return d.length === 11 && d.startsWith("1") ? d.slice(1) : d;
+}
+
+// Send an email via Salesforce's emailSimple invocable action (from info@).
+async function sfSendEmail(toAddress, subject, body) {
+  if (!sfAuth.access_token) await sfAuthenticate();
+  const url = `${sfAuth.instance_url}/services/data/v59.0/actions/standard/emailSimple`;
+  const payload = {
+    inputs: [{
+      emailAddresses: toAddress,
+      emailSubject: subject,
+      emailBody: body,
+      senderType: "OrgWideEmailAddress",
+      senderAddress: "info@aatatraining.org",
+    }],
+  };
+  let res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${sfAuth.access_token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (res.status === 401) {
+    await sfAuthenticate();
+    res = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${sfAuth.access_token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  }
+  const out = await res.json().catch(() => null);
+  const ok = Array.isArray(out) && out[0] && out[0].isSuccess;
+  if (!ok) console.error("[sfSendEmail] failed:", res.status, JSON.stringify(out).slice(0, 300));
+  return ok;
+}
+
+app.post("/api/log-payment", async (req, res) => {
+  if (!apexSecretValid(req)) return res.status(401).json({ error: "unauthorized" });
+
+  const {
+    guid, source, amount, payer, memo, senderPhone, receivedAt, raw, dryRun,
+  } = req.body || {};
+  const amt = Number(amount);
+  if (!guid || !amt || amt <= 0) {
+    return res.status(400).json({ error: "guid and positive amount required" });
+  }
+
+  try {
+    // Idempotency: has this message GUID already been applied?
+    const guidSafe = String(guid).replace(/'/g, "");
+    const dup = await sfQuery(
+      `SELECT Id FROM FeedItem WHERE Body LIKE '%[PAYMENT ${guidSafe}]%' LIMIT 1`);
+    if (dup.records && dup.records.length) {
+      return res.json({ matched: true, duplicate: true, applied: false });
+    }
+
+    // Candidate students: anyone past DAS signing (the people who owe fees)
+    const cand = await sfQuery(
+      `SELECT Id, FirstName, LastName, Email, Phone, MobilePhone, ` +
+      `Received_Book_Fees__c, Enrollment_Status__c FROM Contact ` +
+      `WHERE Enrollment_Status__c IN ('DAS Signed','Emails Sent','Payment Received','Fully Enrolled')`);
+    const students = cand.records || [];
+
+    // ── Matching ──
+    const matches = [];
+    const phone = normPhone(senderPhone);
+    const payerLc = String(payer || "").toLowerCase().trim();
+    const memoLc = String(memo || "").toLowerCase();
+    for (const s of students) {
+      const full = `${s.FirstName || ""} ${s.LastName || ""}`.toLowerCase().trim();
+      const phoneHit = phone && (normPhone(s.MobilePhone) === phone || normPhone(s.Phone) === phone);
+      // Zelle payer names often include middle names — require the contact's
+      // first AND last name to appear in the payer string (or memo).
+      const first = (s.FirstName || "").toLowerCase();
+      const last = (s.LastName || "").toLowerCase();
+      const nameHit = first && last && (
+        payerLc === full ||
+        (payerLc.includes(first) && payerLc.includes(last)) ||
+        (memoLc.includes(first) && memoLc.includes(last))
+      );
+      if (phoneHit || nameHit) matches.push({ s, phoneHit, nameHit });
+    }
+
+    // ── Safety rails → review instead of auto-apply ──
+    const reasons = [];
+    if (matches.length === 0) reasons.push("no matching student");
+    if (matches.length > 1) reasons.push(`ambiguous: ${matches.length} students match`);
+    if (amt > 400) reasons.push(`amount $${amt} exceeds $400 sanity cap`);
+
+    if (reasons.length === 0) {
+      const { s } = matches[0];
+      // Duplicate same-amount-same-day for this contact → review
+      const today = new Date().toISOString().slice(0, 10);
+      const sameDay = await sfQuery(
+        `SELECT Id FROM FeedItem WHERE ParentId = '${s.Id}' AND CreatedDate = TODAY ` +
+        `AND Body LIKE '%[PAYMENT %' AND Body LIKE '%$${amt.toFixed(2)}%' LIMIT 1`);
+      if (sameDay.records && sameDay.records.length) {
+        reasons.push(`duplicate $${amt.toFixed(2)} for ${s.FirstName} ${s.LastName} today`);
+      }
+    }
+
+    if (reasons.length > 0) {
+      const closest = matches.slice(0, 3).map(m => `${m.s.FirstName} ${m.s.LastName} (${m.s.Email})`).join(", ");
+      if (!dryRun) {
+        await sfSendEmail("info@aatatraining.org",
+          `AATA payment needs review — $${amt.toFixed(2)} via ${source || "?"}`,
+          `A payment text could not be auto-logged.\n\nReason: ${reasons.join("; ")}\n` +
+          `Payer: ${payer || "?"}\nMemo: ${memo || "—"}\nAmount: $${amt.toFixed(2)}\n` +
+          `Received: ${receivedAt || "?"}\n\nRaw message:\n${String(raw || "").slice(0, 500)}\n\n` +
+          (closest ? `Closest candidates: ${closest}\n\n` : "") +
+          `Log it manually on the Contact (Received $ Book Fees field) if legitimate.`);
+      }
+      return res.json({ matched: false, review: true, reasons, dryRun: !!dryRun });
+    }
+
+    // ── Confident match — apply ──
+    const { s } = matches[0];
+    const prevPaid = Number(s.Received_Book_Fees__c || 0);
+    const newTotal = prevPaid + amt;
+    const fullPaid = newTotal >= BOOK_FEE_TOTAL;
+    const willFlip = fullPaid && s.Enrollment_Status__c === "Emails Sent";
+
+    if (dryRun) {
+      return res.json({
+        matched: true, dryRun: true, applied: false,
+        student: `${s.FirstName} ${s.LastName}`, contactId: s.Id,
+        wouldSetTotal: newTotal, wouldFlipStatus: willFlip,
+      });
+    }
+
+    const updBody = { Received_Book_Fees__c: newTotal };
+    if (willFlip) updBody.Enrollment_Status__c = "Payment Received";
+    const upd = await sfUpdate("Contact", s.Id, updBody);
+    if (upd.status !== 204 && upd.status !== 200) {
+      throw new Error("Contact update failed: " + JSON.stringify(upd.body).slice(0, 300));
+    }
+
+    await sfCreate("FeedItem", {
+      ParentId: s.Id,
+      Body: `[PAYMENT ${guid}] $${amt.toFixed(2)} received via ${source || "unknown"} on ${receivedAt || "unknown date"}.\n` +
+        `Payer: ${payer || "—"} | Memo: ${memo || "—"}\n` +
+        `Book fee total: $${newTotal.toFixed(2)} of $${BOOK_FEE_TOTAL}` +
+        (willFlip ? " — PAID IN FULL, status moved to Payment Received." : "") +
+        `\nRaw: ${String(raw || "").slice(0, 300)}`,
+    }).catch((e) => console.warn("[log-payment] chatter failed:", e.message));
+
+    // Acknowledgment email to the student
+    if (s.Email) {
+      const ackBody = fullPaid
+        ? `Hi ${s.FirstName},\n\nWe received your payment of $${amt.toFixed(2)} on ${receivedAt || "today"} — ` +
+          `your $325 book fee is now PAID IN FULL. Your ASNT books will be shipped to your home via FedEx.\n\n` +
+          `Thank you, and welcome aboard!\n\nAATA Team`
+        : `Hi ${s.FirstName},\n\nWe received your payment of $${amt.toFixed(2)} on ${receivedAt || "today"} — thank you!\n\n` +
+          `Your book fee balance is now $${(BOOK_FEE_TOTAL - newTotal).toFixed(2)} (of the $325 total). ` +
+          `A reminder: the full amount must be received at least 2 weeks before your class starts ` +
+          `(or before the class fills — paid-in-full students get priority once it does).\n\n` +
+          `Payment options: Zelle / Apple Cash: 424-385-1149 · Cash App: $WaghNDT · PayPal: paypal.me/ppwagh\n\nAATA Team`;
+      await sfSendEmail(s.Email, "Re: Your AATA enrollment — payment received", ackBody);
+    }
+
+    res.json({
+      matched: true, applied: true,
+      student: `${s.FirstName} ${s.LastName}`, contactId: s.Id,
+      newTotal, statusFlipped: willFlip,
+    });
+  } catch (err) {
+    console.error("[log-payment] error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
 // ENROLLMENT STATUS ENDPOINT (returning student lookup)
 // ============================================================
 app.get("/api/enrollment-status", async (req, res) => {
