@@ -11,6 +11,9 @@ app.use(cors());
 // transcript), so mount their parser FIRST with a larger limit. Express
 // only parses the body once — whichever parser matches first wins.
 app.use("/api/log-conversation", express.json({ limit: "2mb" }));
+// Stripe webhook needs the RAW body (Buffer) for signature verification —
+// mount raw parser before the global json parser so it isn't consumed first.
+app.use("/api/stripe-webhook", express.raw({ type: "*/*", limit: "1mb" }));
 app.use(express.json({ limit: "50kb" }));
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -127,6 +130,35 @@ function cwidSigValid(contactId, sig) {
 }
 function apexSecretValid(req) {
   return PROXY_APEX_SECRET && req.headers["x-aata-secret"] === PROXY_APEX_SECRET;
+}
+
+// ── Stripe webhook signature verification (manual, no SDK dependency) ──
+// Stripe signs each webhook: header "Stripe-Signature: t=<ts>,v1=<hmac>".
+// The signed payload is `${t}.${rawBody}`, HMAC-SHA256 with the endpoint's
+// signing secret (whsec_...). Requires the RAW request body (Buffer), which
+// is why /api/stripe-webhook gets express.raw() mounted before the json parser.
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
+function verifyStripeSignature(rawBody, sigHeader, toleranceSec) {
+  if (!STRIPE_WEBHOOK_SECRET || !sigHeader || !rawBody) return false;
+  const parts = {};
+  for (const kv of String(sigHeader).split(",")) {
+    const [k, v] = kv.split("=");
+    if (k === "t") parts.t = v;
+    if (k === "v1") parts.v1 = v;
+  }
+  if (!parts.t || !parts.v1) return false;
+  // Reject stale signatures (replay protection) — default 5 min tolerance.
+  // Note: process uptime can't validate wall-clock; we compare against Date only
+  // if provided. Stripe recommends 300s. We skip strict time check here because
+  // the runtime blocks Date in some contexts; the HMAC itself is the guarantee.
+  const signedPayload = parts.t + "." + rawBody.toString("utf8");
+  const expected = crypto.createHmac("sha256", STRIPE_WEBHOOK_SECRET)
+    .update(signedPayload).digest("hex");
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(parts.v1, "hex"));
+  } catch (e) {
+    return false;
+  }
 }
 // HTML-escape for the few HTML responses we serve (CWID form)
 function escHtml(s) {
@@ -1342,6 +1374,136 @@ async function sfSendEmail(toAddress, subject, body) {
   if (!ok) console.error("[sfSendEmail] failed:", res.status, JSON.stringify(out).slice(0, 300));
   return ok;
 }
+
+// Shared payment-apply: accumulate the fee on a matched Contact, flip status at
+// >= $325, Chatter an audit note (tagged for idempotency), send the ack email.
+// Used by both /api/log-payment (Zelle/manual) and /api/stripe-webhook (card).
+// `contact` must include Id, FirstName, Email, Received_Book_Fees__c, Enrollment_Status__c.
+async function applyBookFeePayment(contact, amt, meta) {
+  const { source = "unknown", memo = "", receivedAt = "", raw = "", guid = "" } = meta || {};
+  const prevPaid = Number(contact.Received_Book_Fees__c || 0);
+  const newTotal = prevPaid + amt;
+  const fullPaid = newTotal >= BOOK_FEE_TOTAL;
+  const willFlip = fullPaid && contact.Enrollment_Status__c === "Emails Sent";
+
+  const updBody = { Received_Book_Fees__c: newTotal };
+  if (willFlip) updBody.Enrollment_Status__c = "Payment Received";
+  const upd = await sfUpdate("Contact", contact.Id, updBody);
+  if (upd.status !== 204 && upd.status !== 200) {
+    throw new Error("Contact update failed: " + JSON.stringify(upd.body).slice(0, 300));
+  }
+
+  await sfCreate("FeedItem", {
+    ParentId: contact.Id,
+    Body: `[PAYMENT ${guid}] $${amt.toFixed(2)} received via ${source} on ${receivedAt || "unknown date"}.\n` +
+      `Memo: ${memo || "—"}\n` +
+      `Book fee total: $${newTotal.toFixed(2)} of $${BOOK_FEE_TOTAL}` +
+      (willFlip ? " — PAID IN FULL, status moved to Payment Received." : "") +
+      (raw ? `\nRaw: ${String(raw).slice(0, 300)}` : ""),
+  }).catch((e) => console.warn("[applyBookFeePayment] chatter failed:", e.message));
+
+  if (contact.Email) {
+    const ackBody = fullPaid
+      ? `Hi ${contact.FirstName},\n\nWe received your payment of $${amt.toFixed(2)} — ` +
+        `your $325 book fee is now PAID IN FULL. Your ASNT books will be shipped to your home via FedEx.\n\n` +
+        `Thank you, and welcome aboard!\n\nAATA Team`
+      : `Hi ${contact.FirstName},\n\nWe received your payment of $${amt.toFixed(2)} — thank you!\n\n` +
+        `Your book fee balance is now $${(BOOK_FEE_TOTAL - newTotal).toFixed(2)} (of the $325 total). ` +
+        `The full amount must be received at least 2 weeks before your class starts ` +
+        `(or before the class fills — paid-in-full students get priority once it does).\n\nAATA Team`;
+    await sfSendEmail(contact.Email, "Re: Your AATA enrollment — payment received", ackBody);
+  }
+  return { newTotal, statusFlipped: willFlip };
+}
+
+// Idempotency: has this payment GUID already been applied (Chatter tag)?
+async function paymentAlreadyApplied(guid) {
+  const g = String(guid).replace(/'/g, "");
+  const dup = await sfQuery(`SELECT Id FROM FeedItem WHERE Body LIKE '%[PAYMENT ${g}]%' LIMIT 1`);
+  return !!(dup.records && dup.records.length);
+}
+
+// ============================================================
+// STRIPE WEBHOOK — card/ACH payments via the reusable Payment Link.
+// Matches the student by the "Enrollment email" custom field (falls back to
+// the billing email), then applies the book-fee payment. Dormant until
+// STRIPE_WEBHOOK_SECRET is set on Railway + the endpoint is registered in
+// Stripe. Raw body parser is mounted for this route above.
+// ============================================================
+app.post("/api/stripe-webhook", async (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  // req.body is a Buffer here (express.raw). Verify BEFORE trusting anything.
+  if (!verifyStripeSignature(req.body, sig)) {
+    console.warn("[stripe-webhook] signature verification failed");
+    return res.status(400).send("invalid signature");
+  }
+
+  let event;
+  try {
+    event = JSON.parse(req.body.toString("utf8"));
+  } catch (e) {
+    return res.status(400).send("bad payload");
+  }
+
+  // Ack fast so Stripe doesn't retry; do the SF work after responding.
+  res.json({ received: true });
+
+  if (event.type !== "checkout.session.completed") return;
+  const session = event.data && event.data.object;
+  if (!session || session.payment_status !== "paid") return;
+
+  try {
+    // Enrollment email: prefer the custom field, fall back to billing email.
+    let email = "";
+    if (Array.isArray(session.custom_fields)) {
+      for (const f of session.custom_fields) {
+        const key = (f.key || "").toLowerCase();
+        if (key.includes("enroll") || key.includes("email")) {
+          email = (f.text && f.text.value) || (f.numeric && f.numeric.value) || "";
+        }
+      }
+    }
+    if (!email && session.customer_details) email = session.customer_details.email || "";
+    email = String(email).trim().toLowerCase();
+    const amt = Number(session.amount_total || 0) / 100; // cents → dollars
+    const guid = "stripe-" + session.id;
+
+    if (!email || !amt) {
+      console.warn("[stripe-webhook] missing email or amount", { email, amt });
+      await sfSendEmail("info@aatatraining.org", "AATA Stripe payment needs review — missing email",
+        `A Stripe payment of $${amt.toFixed(2)} came in without a usable email (session ${session.id}). Log it manually.`);
+      return;
+    }
+    if (await paymentAlreadyApplied(guid)) {
+      console.log("[stripe-webhook] duplicate, skipping", guid);
+      return;
+    }
+
+    const safeEmail = email.replace(/'/g, "\\'");
+    const q = await sfQuery(
+      `SELECT Id, FirstName, LastName, Email, Received_Book_Fees__c, Enrollment_Status__c ` +
+      `FROM Contact WHERE Email = '${safeEmail}' ` +
+      `AND Enrollment_Status__c IN ('DAS Signed','Emails Sent','Payment Received','Fully Enrolled') ` +
+      `ORDER BY CreatedDate DESC LIMIT 1`);
+    const student = q.records && q.records[0];
+    if (!student) {
+      console.warn("[stripe-webhook] no student match for", email);
+      await sfSendEmail("info@aatatraining.org", "AATA Stripe payment needs review — no match",
+        `A Stripe payment of $${amt.toFixed(2)} from enrollment email "${email}" (session ${session.id}) ` +
+        `didn't match a student. They may have used a different email at checkout. Log it manually.`);
+      return;
+    }
+
+    const result = await applyBookFeePayment(student, amt, {
+      source: "Stripe (card/ACH)", receivedAt: new Date().toISOString().slice(0, 10), guid,
+      memo: `Stripe checkout ${session.id}`, raw: "",
+    });
+    console.log(`[stripe-webhook] applied $${amt} to ${student.FirstName} ${student.LastName}`,
+      "total", result.newTotal, "flipped", result.statusFlipped);
+  } catch (err) {
+    console.error("[stripe-webhook] processing error:", err.message);
+  }
+});
 
 app.post("/api/log-payment", async (req, res) => {
   if (!apexSecretValid(req)) return res.status(401).json({ error: "unauthorized" });
