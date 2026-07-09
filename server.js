@@ -908,51 +908,99 @@ app.post("/api/create-enrollment", async (req, res) => {
       });
     }
 
-    // 2. Create the Contact (Apex trigger fires Box Sign on insert).
-    // RecordTypeId is the AATA "Student" record type — without explicitly
-    // setting this, NPSP defaults Contacts to "Supporter" (a donor record
-    // type) which is wrong for enrollees and made every chatbot Contact
-    // look like a donor in list views and reports.
-    const contactPayload = {
-      FirstName: data.firstName,
-      LastName: data.lastName,
-      Email: data.email,
-      MobilePhone: data.mobilePhone,
-      MailingStreet: data.mailingStreet,
-      MailingCity: data.mailingCity,
-      MailingState: data.mailingState,
-      MailingPostalCode: data.mailingPostalCode,
-      Class_Selection__c: data.classSelection,
-      Enrollment_Status__c: "Step 1 Complete",
-      Enrollment_Source__c: "AI Chatbot",
-      Consent_Agreed__c: true,
-      Consent_Timestamp__c: consentTs,
-      RecordTypeId: "0125Y000001OLx7QAG",  // Contact.Student
-    };
-    const contactRes = await sfCreate("Contact", contactPayload);
-    if (contactRes.status !== 201 || !contactRes.body.id) {
-      console.error("Contact create failed:", contactRes.body);
-      return res.status(500).json({ ok: false, error: "Contact create failed", details: contactRes.body });
-    }
-    const contactId = contactRes.body.id;
-    console.log("Created Contact:", contactId, "for", data.email);
+    // 2. DEDUPE: reuse an existing Contact with this email instead of
+    // creating a duplicate. Returning students who run through enrollment
+    // again were previously creating a brand-new Contact + Class Registration
+    // every time (eating seats) and re-triggering a redundant Box Sign DAS,
+    // because the Apex trigger fires on every Contact INSERT. Reusing the
+    // existing Contact means NO insert → NO redundant DAS, and their prior
+    // progress (signed DAS, CWID, fees, status) is preserved untouched.
+    const safeEmail = email.replace(/'/g, "\\'");
+    const existingQ = await sfQuery(
+      `SELECT Id, FirstName, Enrollment_Status__c FROM Contact ` +
+      `WHERE Email = '${safeEmail}' ORDER BY CreatedDate ASC LIMIT 1`
+    );
+    const existing = (existingQ.records || [])[0];
 
-    // 3. Create the Class Registration linking student to the matched class
-    const regRes = await sfCreate("yClasses__Class_Registration__c", {
-      yClasses__Student__c: contactId,
-      yClasses__Class__c: matchedClass.Id,
-    });
-    if (regRes.status !== 201) {
-      console.error("Class registration create warning:", regRes.body);
-      // Don't fail — contact + DAS still proceed
+    let contactId;
+    let isReturning = false;
+    if (existing) {
+      isReturning = true;
+      contactId = existing.Id;
+      console.log("Reusing existing Contact:", contactId, "for", email,
+        "(status:", existing.Enrollment_Status__c + ") — no duplicate, no re-send");
+      // Refresh contact/shipping details if provided, but NEVER touch
+      // Enrollment_Status__c (would re-fire the trigger / lose progress) and
+      // never blank an existing value.
+      const refresh = {};
+      if (data.mobilePhone)     refresh.MobilePhone = data.mobilePhone;
+      if (data.mailingStreet)   refresh.MailingStreet = data.mailingStreet;
+      if (data.mailingCity)     refresh.MailingCity = data.mailingCity;
+      if (data.mailingState)    refresh.MailingState = data.mailingState;
+      if (data.mailingPostalCode) refresh.MailingPostalCode = data.mailingPostalCode;
+      if (Object.keys(refresh).length) {
+        await sfUpdate("Contact", contactId, refresh)
+          .catch((e) => console.warn("[create-enrollment] contact refresh failed:", e.message));
+      }
+    } else {
+      // New student — create the Contact (Apex trigger fires Box Sign on insert).
+      // RecordTypeId is the AATA "Student" record type — without it NPSP
+      // defaults Contacts to "Supporter" (a donor type), wrong for enrollees.
+      const contactPayload = {
+        FirstName: data.firstName,
+        LastName: data.lastName,
+        Email: data.email,
+        MobilePhone: data.mobilePhone,
+        MailingStreet: data.mailingStreet,
+        MailingCity: data.mailingCity,
+        MailingState: data.mailingState,
+        MailingPostalCode: data.mailingPostalCode,
+        Class_Selection__c: data.classSelection,
+        Enrollment_Status__c: "Step 1 Complete",
+        Enrollment_Source__c: "AI Chatbot",
+        Consent_Agreed__c: true,
+        Consent_Timestamp__c: consentTs,
+        RecordTypeId: "0125Y000001OLx7QAG",  // Contact.Student
+      };
+      const contactRes = await sfCreate("Contact", contactPayload);
+      if (contactRes.status !== 201 || !contactRes.body.id) {
+        console.error("Contact create failed:", contactRes.body);
+        return res.status(500).json({ ok: false, error: "Contact create failed", details: contactRes.body });
+      }
+      contactId = contactRes.body.id;
+      console.log("Created Contact:", contactId, "for", data.email);
+    }
+
+    // 3. Class Registration — only if no ACTIVE (non-removed) registration
+    // already links this student to this class. Prevents duplicate seats
+    // even when the same Contact is reused.
+    const regDupQ = await sfQuery(
+      `SELECT Id FROM yClasses__Class_Registration__c ` +
+      `WHERE yClasses__Student__c = '${contactId}' AND yClasses__Class__c = '${matchedClass.Id}' ` +
+      `AND yClasses__Removed_Date__c = null LIMIT 1`
+    );
+    if (regDupQ.records && regDupQ.records.length) {
+      console.log("Active registration already exists for this class — skipping duplicate.");
+    } else {
+      const regRes = await sfCreate("yClasses__Class_Registration__c", {
+        yClasses__Student__c: contactId,
+        yClasses__Class__c: matchedClass.Id,
+      });
+      if (regRes.status !== 201) {
+        console.error("Class registration create warning:", regRes.body);
+        // Don't fail — contact + DAS still proceed
+      }
     }
 
     res.json({
       ok: true,
       contactId,
+      returning: isReturning,
       className: matchedClass.Name,
       classStartDate: matchedClass.yClasses__First_Session_Date__c,
-      message: "Contact created. DAS 1 e-signature email will arrive within 1-2 minutes.",
+      message: isReturning
+        ? "You're already in our system — we've made sure you're registered and haven't created a duplicate. Check your email (and spam) for any pending steps like your DAS form or Foothill instructions."
+        : "Contact created. DAS 1 e-signature email will arrive within 1-2 minutes.",
     });
   } catch (err) {
     console.error("Create enrollment error:", err.message);
