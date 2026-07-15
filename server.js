@@ -364,11 +364,11 @@ ${classSection}
 - **Out-of-State Residents**: Funding is handled on a case-by-case basis. Direct them to leave a message at https://www.aatatraining.org/apply
 - IMPORTANT: Do NOT proactively mention veteran-specific funding.
 
-### Book Fee Payment Methods:
-- Zelle / Apple Cash: ${get("zelle", "424-385-1149")}
-- Cash App: ${get("cashapp", "$WaghNDT")}
-- PayPal: ${get("paypal", "https://paypal.me/ppwagh")}
-- Credit Card: ${get("creditcard", "Contact Pratik directly at 424-385-1149")}
+### Book Fee Payment ($325):
+- Pay securely online — card, Apple Pay, or bank transfer: ${get("pay_link", "https://buy.stripe.com/aFa00i46EfPVevB6vh0VO00")}
+- To split into two payments of $162.50 each, use the split-payment link and pay it twice: ${get("pay_link_split", "https://buy.stripe.com/7sY14mgTqgTZ4V1cTF0VO01")}
+- IMPORTANT for the student: at checkout, enter the SAME email you enrolled with in the "Enrollment email" field, so the payment is matched to your record automatically.
+- Payment must be completed at least 2 weeks before the class start date (or before the class fills — paid-in-full students get priority once it's full).
 
 ## ENROLLMENT REQUIREMENTS
 - Prerequisites: NONE - just have a drive to learn
@@ -1334,7 +1334,7 @@ app.post("/api/compose-reminder", async (req, res) => {
 - This is reminder #${reminderNumber || 1} to this student. Vary tone by number: 1=friendly nudge, 2=helpful check-in (offer help), 3=gentle urgency, 4=direct but kind, 5=final heads-up.
 - Outstanding items: ${outstanding.join("; ") || "none"} — cover ONLY these, in one email.
 - ${cwidMissing && cwidLink ? `Include this exact link for submitting the CWID: ${cwidLink} (present it as a button-style link "Submit your CWID"). Also mention they can simply reply to this email with the 8-digit number.` : ""}
-- ${(amountDue || 0) > 0 ? `Payment policy to convey naturally: whether paying $325 once or split in two $162.50 payments, the FULL amount must be received at least 2 weeks before the class start date${classStartDate ? ` (${classStartDate})` : ""} or before the class fills — once full, students who paid in full get priority.${spotsRemaining != null ? ` Spots remaining right now: ${spotsRemaining}.` : ""} Payment options: Zelle/Apple Cash 424-385-1149, Cash App $WaghNDT, PayPal paypal.me/ppwagh.` : ""}
+- ${(amountDue || 0) > 0 ? `Payment policy to convey naturally: whether paying $325 once or split in two $162.50 payments, the FULL amount must be received at least 2 weeks before the class start date${classStartDate ? ` (${classStartDate})` : ""} or before the class fills — once full, students who paid in full get priority.${spotsRemaining != null ? ` Spots remaining right now: ${spotsRemaining}.` : ""} Payment: pay the $325 securely at https://buy.stripe.com/aFa00i46EfPVevB6vh0VO00 (card, Apple Pay, or bank). To split into two $162.50 payments, use https://buy.stripe.com/7sY14mgTqgTZ4V1cTF0VO01 and pay it twice. At checkout they must enter the same email they enrolled with.` : ""}
 - ${lastReplyText ? `The student previously wrote: "${String(lastReplyText).slice(0, 600)}" — briefly acknowledge/answer it first.` : ""}
 - Never invent facts, dates, or amounts beyond what's given. Subject must ALWAYS be exactly "Re: Your AATA enrollment — next steps" (threading).`;
 
@@ -1457,6 +1457,8 @@ async function applyBookFeePayment(contact, amt, meta) {
         `Thank you, and welcome aboard!\n\nAATA Team`
       : `Hi ${contact.FirstName},\n\nWe received your payment of $${amt.toFixed(2)} — thank you!\n\n` +
         `Your book fee balance is now $${(BOOK_FEE_TOTAL - newTotal).toFixed(2)} (of the $325 total). ` +
+        `To pay the remaining balance, use the split-payment link: https://buy.stripe.com/7sY14mgTqgTZ4V1cTF0VO01 ` +
+        `(enter the same email you enrolled with).\n\n` +
         `The full amount must be received at least 2 weeks before your class starts ` +
         `(or before the class fills — paid-in-full students get priority once it does).\n\nAATA Team`;
     await sfSendEmail(contact.Email, "Re: Your AATA enrollment — payment received", ackBody);
@@ -1673,7 +1675,7 @@ app.post("/api/log-payment", async (req, res) => {
           `Your book fee balance is now $${(BOOK_FEE_TOTAL - newTotal).toFixed(2)} (of the $325 total). ` +
           `A reminder: the full amount must be received at least 2 weeks before your class starts ` +
           `(or before the class fills — paid-in-full students get priority once it does).\n\n` +
-          `Payment options: Zelle / Apple Cash: 424-385-1149 · Cash App: $WaghNDT · PayPal: paypal.me/ppwagh\n\nAATA Team`;
+          `To pay the remaining balance, use the split-payment link: https://buy.stripe.com/7sY14mgTqgTZ4V1cTF0VO01 (enter the same email you enrolled with).\n\nAATA Team`;
       await sfSendEmail(s.Email, "Re: Your AATA enrollment — payment received", ackBody);
     }
 
