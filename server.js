@@ -529,13 +529,11 @@ CRITICAL FORMAT RULES for the marker:
 - JSON on a single line, double quotes only, exact key name "email".
 - Do NOT explain the marker to the user; the frontend hides it, performs the live Salesforce lookup, and shows a status card.
 
-After the lookup, the frontend injects a [SYSTEM: Returning student ...] (found) or [SYSTEM: Status lookup ...] (not found / error) message. Use the status to guide their next step:
-- **Step 1 Complete / DAS Sent** → "Check your email — we sent you the DAS 1 Apprentice Agreement to sign"
-- **DAS Signed** → "You signed your DAS 1 — the Foothill enrollment + book fee payment emails are on their way"
-- **Emails Sent** → "Check your email for the Foothill College application + book fee payment instructions. Have you completed those?"
-- **Payment Received** → "Payment received! You're almost fully enrolled."
-- **Fully Enrolled** → "You're all set! Welcome to AATA!"
-- **Not found** → They may have used a different email (offer to try another), or start a fresh enrollment
+After the lookup, the frontend injects a [SYSTEM: Returning student ...] message containing GROUND-TRUTH facts: whether the DAS is signed, whether their Foothill CWID is on file (with a submit link if missing), and exactly how much of the $325 book fee has been received. **Always speak from those itemized facts — never from a generic status label.** Rules:
+- Congratulate what's already done ("your DAS is signed and your CWID is on file ✅").
+- Only guide them on the items that are actually missing/remaining (e.g., "$35.00 remaining on your book fee — here's the payment link").
+- NEVER tell a student to "check your email" or re-do a step the facts show is already complete.
+- **Not found** → They may have used a different email (offer to try another), or start a fresh enrollment.
 
 ## ENROLLMENT FLOW CONVERSATION STRATEGY
 When a student says they want to enroll or are ready to sign up:
@@ -1718,7 +1716,7 @@ app.get("/api/enrollment-status", async (req, res) => {
     const safeEmail = email.replace(/'/g, "\\'");
     const soql =
       `SELECT Id, FirstName, LastName, Email, Enrollment_Status__c, Class_Selection__c, ` +
-      `Box_Sign_Request_ID__c, DAS_Signed_Date__c ` +
+      `Box_Sign_Request_ID__c, DAS_Signed_Date__c, Foothill_CWID__c, Received_Book_Fees__c ` +
       `FROM Contact WHERE Email = '${safeEmail}' ` +
       `ORDER BY CreatedDate DESC LIMIT 1`;
     const result = await sfQuery(soql);
@@ -1726,16 +1724,58 @@ app.get("/api/enrollment-status", async (req, res) => {
       return res.json({ found: false });
     }
     const c = result.records[0];
+
+    // ── Derive the REAL state from ground-truth fields, not the manually
+    // maintained Enrollment_Status__c (which can lag reality — students were
+    // being told to "check your emails" months after they paid + submitted
+    // their CWID). The itemized facts below are what the UI/bot should use.
+    const dasSigned = !!c.DAS_Signed_Date__c;
+    const cwidOnFile = !!(c.Foothill_CWID__c && String(c.Foothill_CWID__c).trim());
+    const bookFeePaid = Number(c.Received_Book_Fees__c || 0);
+    const bookFeeBalance = Math.max(0, BOOK_FEE_TOTAL - bookFeePaid);
+    const fullPaid = bookFeePaid >= BOOK_FEE_TOTAL;
+
+    // Auto-heal the stale status field for the one sanctioned transition:
+    // fully paid but still 'Emails Sent' → 'Payment Received'. Same rule the
+    // payment webhook applies; doing it here fixes records paid before the
+    // automation existed the next time the student checks their status.
+    let status = c.Enrollment_Status__c;
+    let statusHealed = false;
+    if (fullPaid && status === "Emails Sent") {
+      const upd = await sfUpdate("Contact", c.Id, { Enrollment_Status__c: "Payment Received" });
+      if (upd.status === 204 || upd.status === 200) {
+        status = "Payment Received";
+        statusHealed = true;
+        sfCreate("FeedItem", {
+          ParentId: c.Id,
+          Body: "[status-heal] Enrollment_Status__c auto-corrected 'Emails Sent' → 'Payment Received' during a status check: Received_Book_Fees__c ($" + bookFeePaid.toFixed(2) + ") already meets the $" + BOOK_FEE_TOTAL + " total.",
+        }).catch(() => {});
+        console.log("[enrollment-status] healed stale status for", c.Id);
+      }
+    }
+
     res.json({
       found: true,
       contactId: c.Id,
       firstName: c.FirstName,
       lastName: c.LastName,
       email: c.Email,
-      enrollmentStatus: c.Enrollment_Status__c,
+      enrollmentStatus: status,
+      statusHealed,
       classSelection: c.Class_Selection__c,
       hasBoxSignRequest: !!c.Box_Sign_Request_ID__c,
       dasSignedDate: c.DAS_Signed_Date__c,
+      // Itemized ground truth (the source the UI/bot should trust):
+      dasSigned,
+      cwidOnFile,
+      bookFeePaid,
+      bookFeeBalance,
+      fullPaid,
+      // Signed magic link so a student missing their CWID can submit it
+      // right from the status card / bot reply.
+      cwidLink: !cwidOnFile && CWID_LINK_SECRET
+        ? `https://aata-proxy-production.up.railway.app/cwid?c=${c.Id}&s=${cwidSig(c.Id)}`
+        : null,
     });
   } catch (err) {
     console.error("Enrollment status error:", err.message);
