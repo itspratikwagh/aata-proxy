@@ -529,10 +529,11 @@ CRITICAL FORMAT RULES for the marker:
 - JSON on a single line, double quotes only, exact key name "email".
 - Do NOT explain the marker to the user; the frontend hides it, performs the live Salesforce lookup, and shows a status card.
 
-After the lookup, the frontend injects a [SYSTEM: Returning student ...] message containing GROUND-TRUTH facts: whether the DAS is signed, whether their Foothill CWID is on file (with a submit link if missing), and exactly how much of the $325 book fee has been received. **Always speak from those itemized facts — never from a generic status label.** Rules:
+After the lookup, the frontend injects a [SYSTEM: Returning student ...] message containing GROUND-TRUTH facts: whether the DAS is signed, whether their Foothill CWID is on file (with a submit link if missing), and exactly how much of their book fee has been received against THEIR effective total (some students have an adjusted total — always use the amounts given, never assume $325). **Always speak from those itemized facts — never from a generic status label.** Rules:
 - Congratulate what's already done ("your DAS is signed and your CWID is on file ✅").
 - Only guide them on the items that are actually missing/remaining (e.g., "$35.00 remaining on your book fee — here's the payment link").
 - NEVER tell a student to "check your email" or re-do a step the facts show is already complete.
+- The [SYSTEM] message may include INTERNAL STAFF NOTES for context (adjustments, special arrangements, past issues). These are CONFIDENTIAL: never quote them, never mention that notes exist, never reveal names/reasons/details from them. Use them ONLY to avoid giving wrong guidance (e.g., if notes show an arrangement was made, don't contradict it — acknowledge their account is in good standing and offer staff follow-up for specifics).
 - **Not found** → They may have used a different email (offer to try another), or start a fresh enrollment.
 
 ## ENROLLMENT FLOW CONVERSATION STRATEGY
@@ -1437,12 +1438,15 @@ async function sfSendEmail(toAddress, subject, body) {
 // Shared payment-apply: accumulate the fee on a matched Contact, flip status at
 // >= $325, Chatter an audit note (tagged for idempotency), send the ack email.
 // Used by both /api/log-payment (Zelle/manual) and /api/stripe-webhook (card).
-// `contact` must include Id, FirstName, Email, Received_Book_Fees__c, Enrollment_Status__c.
+// `contact` must include Id, FirstName, Email, Received_Book_Fees__c,
+// Enrollment_Status__c — and Book_Fee_Due__c when available (per-student
+// adjusted total, e.g. a granted discount; blank = standard $325).
 async function applyBookFeePayment(contact, amt, meta) {
   const { source = "unknown", memo = "", receivedAt = "", raw = "", guid = "" } = meta || {};
   const prevPaid = Number(contact.Received_Book_Fees__c || 0);
+  const feeDue = Number(contact.Book_Fee_Due__c || BOOK_FEE_TOTAL);
   const newTotal = prevPaid + amt;
-  const fullPaid = newTotal >= BOOK_FEE_TOTAL;
+  const fullPaid = newTotal >= feeDue;
   const willFlip = fullPaid && contact.Enrollment_Status__c === "Emails Sent";
 
   const updBody = { Received_Book_Fees__c: newTotal };
@@ -1456,7 +1460,8 @@ async function applyBookFeePayment(contact, amt, meta) {
     ParentId: contact.Id,
     Body: `[PAYMENT ${guid}] $${amt.toFixed(2)} received via ${source} on ${receivedAt || "unknown date"}.\n` +
       `Memo: ${memo || "—"}\n` +
-      `Book fee total: $${newTotal.toFixed(2)} of $${BOOK_FEE_TOTAL}` +
+      `Book fee total: $${newTotal.toFixed(2)} of $${feeDue.toFixed(2)}` +
+      (feeDue !== BOOK_FEE_TOTAL ? " (adjusted total)" : "") +
       (willFlip ? " — PAID IN FULL, status moved to Payment Received." : "") +
       (raw ? `\nRaw: ${String(raw).slice(0, 300)}` : ""),
   }).catch((e) => console.warn("[applyBookFeePayment] chatter failed:", e.message));
@@ -1464,10 +1469,10 @@ async function applyBookFeePayment(contact, amt, meta) {
   if (contact.Email) {
     const ackBody = fullPaid
       ? `Hi ${contact.FirstName},\n\nWe received your payment of $${amt.toFixed(2)} — ` +
-        `your $325 book fee is now PAID IN FULL. Your ASNT books will be shipped to your home via FedEx.\n\n` +
+        `your book fee is now PAID IN FULL. Your ASNT books will be shipped to your home via FedEx.\n\n` +
         `Thank you, and welcome aboard!\n\nAATA Team`
       : `Hi ${contact.FirstName},\n\nWe received your payment of $${amt.toFixed(2)} — thank you!\n\n` +
-        `Your book fee balance is now $${(BOOK_FEE_TOTAL - newTotal).toFixed(2)} (of the $325 total). ` +
+        `Your book fee balance is now $${(feeDue - newTotal).toFixed(2)} (of the $${feeDue.toFixed(2)} total). ` +
         `To pay the remaining balance, use the split-payment link: https://buy.stripe.com/7sY14mgTqgTZ4V1cTF0VO01 ` +
         `(enter the same email you enrolled with).\n\n` +
         `The full amount must be received at least 2 weeks before your class starts ` +
@@ -1542,7 +1547,7 @@ app.post("/api/stripe-webhook", async (req, res) => {
 
     const safeEmail = email.replace(/'/g, "\\'");
     const q = await sfQuery(
-      `SELECT Id, FirstName, LastName, Email, Received_Book_Fees__c, Enrollment_Status__c ` +
+      `SELECT Id, FirstName, LastName, Email, Received_Book_Fees__c, Book_Fee_Due__c, Enrollment_Status__c ` +
       `FROM Contact WHERE Email = '${safeEmail}' ` +
       `AND Enrollment_Status__c IN ('DAS Signed','Emails Sent','Payment Received','Fully Enrolled') ` +
       `ORDER BY CreatedDate DESC LIMIT 1`);
@@ -1589,7 +1594,7 @@ app.post("/api/log-payment", async (req, res) => {
     // Candidate students: anyone past DAS signing (the people who owe fees)
     const cand = await sfQuery(
       `SELECT Id, FirstName, LastName, Email, Phone, MobilePhone, ` +
-      `Received_Book_Fees__c, Enrollment_Status__c FROM Contact ` +
+      `Received_Book_Fees__c, Book_Fee_Due__c, Enrollment_Status__c FROM Contact ` +
       `WHERE Enrollment_Status__c IN ('DAS Signed','Emails Sent','Payment Received','Fully Enrolled')`);
     const students = cand.records || [];
 
@@ -1648,8 +1653,9 @@ app.post("/api/log-payment", async (req, res) => {
     // ── Confident match — apply ──
     const { s } = matches[0];
     const prevPaid = Number(s.Received_Book_Fees__c || 0);
+    const feeDue = Number(s.Book_Fee_Due__c || BOOK_FEE_TOTAL);
     const newTotal = prevPaid + amt;
-    const fullPaid = newTotal >= BOOK_FEE_TOTAL;
+    const fullPaid = newTotal >= feeDue;
     const willFlip = fullPaid && s.Enrollment_Status__c === "Emails Sent";
 
     if (dryRun) {
@@ -1671,7 +1677,8 @@ app.post("/api/log-payment", async (req, res) => {
       ParentId: s.Id,
       Body: `[PAYMENT ${guid}] $${amt.toFixed(2)} received via ${source || "unknown"} on ${receivedAt || "unknown date"}.\n` +
         `Payer: ${payer || "—"} | Memo: ${memo || "—"}\n` +
-        `Book fee total: $${newTotal.toFixed(2)} of $${BOOK_FEE_TOTAL}` +
+        `Book fee total: $${newTotal.toFixed(2)} of $${feeDue.toFixed(2)}` +
+        (feeDue !== BOOK_FEE_TOTAL ? " (adjusted total)" : "") +
         (willFlip ? " — PAID IN FULL, status moved to Payment Received." : "") +
         `\nRaw: ${String(raw || "").slice(0, 300)}`,
     }).catch((e) => console.warn("[log-payment] chatter failed:", e.message));
@@ -1680,10 +1687,10 @@ app.post("/api/log-payment", async (req, res) => {
     if (s.Email) {
       const ackBody = fullPaid
         ? `Hi ${s.FirstName},\n\nWe received your payment of $${amt.toFixed(2)} on ${receivedAt || "today"} — ` +
-          `your $325 book fee is now PAID IN FULL. Your ASNT books will be shipped to your home via FedEx.\n\n` +
+          `your book fee is now PAID IN FULL. Your ASNT books will be shipped to your home via FedEx.\n\n` +
           `Thank you, and welcome aboard!\n\nAATA Team`
         : `Hi ${s.FirstName},\n\nWe received your payment of $${amt.toFixed(2)} on ${receivedAt || "today"} — thank you!\n\n` +
-          `Your book fee balance is now $${(BOOK_FEE_TOTAL - newTotal).toFixed(2)} (of the $325 total). ` +
+          `Your book fee balance is now $${(feeDue - newTotal).toFixed(2)} (of the $${feeDue.toFixed(2)} total). ` +
           `A reminder: the full amount must be received at least 2 weeks before your class starts ` +
           `(or before the class fills — paid-in-full students get priority once it does).\n\n` +
           `To pay the remaining balance, use the split-payment link: https://buy.stripe.com/7sY14mgTqgTZ4V1cTF0VO01 (enter the same email you enrolled with).\n\nAATA Team`;
@@ -1716,7 +1723,8 @@ app.get("/api/enrollment-status", async (req, res) => {
     const safeEmail = email.replace(/'/g, "\\'");
     const soql =
       `SELECT Id, FirstName, LastName, Email, Enrollment_Status__c, Class_Selection__c, ` +
-      `Box_Sign_Request_ID__c, DAS_Signed_Date__c, Foothill_CWID__c, Received_Book_Fees__c ` +
+      `Box_Sign_Request_ID__c, DAS_Signed_Date__c, Foothill_CWID__c, Received_Book_Fees__c, ` +
+      `Book_Fee_Due__c ` +
       `FROM Contact WHERE Email = '${safeEmail}' ` +
       `ORDER BY CreatedDate DESC LIMIT 1`;
     const result = await sfQuery(soql);
@@ -1732,8 +1740,30 @@ app.get("/api/enrollment-status", async (req, res) => {
     const dasSigned = !!c.DAS_Signed_Date__c;
     const cwidOnFile = !!(c.Foothill_CWID__c && String(c.Foothill_CWID__c).trim());
     const bookFeePaid = Number(c.Received_Book_Fees__c || 0);
-    const bookFeeBalance = Math.max(0, BOOK_FEE_TOTAL - bookFeePaid);
-    const fullPaid = bookFeePaid >= BOOK_FEE_TOTAL;
+    // Per-student effective total: Book_Fee_Due__c overrides the standard
+    // $325 when a discount/adjustment was granted (e.g. Miguel Martinez's
+    // $290). Dollar decisions come from THIS field, never from prose notes.
+    const bookFeeDue = Number(c.Book_Fee_Due__c || BOOK_FEE_TOTAL);
+    const bookFeeBalance = Math.max(0, bookFeeDue - bookFeePaid);
+    const fullPaid = bookFeePaid >= bookFeeDue;
+
+    // Recent Chatter notes — INTERNAL context for the bot only (discounts,
+    // special arrangements, merges). Never rendered on the student card;
+    // the system prompt forbids quoting them.
+    let internalNotes = [];
+    try {
+      const notesQ = await sfQuery(
+        `SELECT CreatedDate, Body FROM FeedItem WHERE ParentId = '${c.Id}' ` +
+        `ORDER BY CreatedDate DESC LIMIT 8`);
+      internalNotes = (notesQ.records || [])
+        .filter((n) => n.Body)
+        .map((n) => ({
+          date: String(n.CreatedDate || "").slice(0, 10),
+          body: String(n.Body).replace(/\s+/g, " ").slice(0, 300),
+        }));
+    } catch (e) {
+      console.warn("[enrollment-status] notes fetch failed:", e.message);
+    }
 
     // Auto-heal the stale status field for the one sanctioned transition:
     // fully paid but still 'Emails Sent' → 'Payment Received'. Same rule the
@@ -1748,7 +1778,7 @@ app.get("/api/enrollment-status", async (req, res) => {
         statusHealed = true;
         sfCreate("FeedItem", {
           ParentId: c.Id,
-          Body: "[status-heal] Enrollment_Status__c auto-corrected 'Emails Sent' → 'Payment Received' during a status check: Received_Book_Fees__c ($" + bookFeePaid.toFixed(2) + ") already meets the $" + BOOK_FEE_TOTAL + " total.",
+          Body: "[status-heal] Enrollment_Status__c auto-corrected 'Emails Sent' → 'Payment Received' during a status check: Received_Book_Fees__c ($" + bookFeePaid.toFixed(2) + ") already meets the $" + bookFeeDue.toFixed(2) + " effective total" + (bookFeeDue !== BOOK_FEE_TOTAL ? " (adjusted from the standard $" + BOOK_FEE_TOTAL + ")" : "") + ".",
         }).catch(() => {});
         console.log("[enrollment-status] healed stale status for", c.Id);
       }
@@ -1769,8 +1799,13 @@ app.get("/api/enrollment-status", async (req, res) => {
       dasSigned,
       cwidOnFile,
       bookFeePaid,
+      bookFeeDue,
       bookFeeBalance,
       fullPaid,
+      // Internal staff Chatter notes — for the BOT'S context only. The
+      // frontend must never render these to the student, and the system
+      // prompt forbids quoting them.
+      internalNotes,
       // Signed magic link so a student missing their CWID can submit it
       // right from the status card / bot reply.
       cwidLink: !cwidOnFile && CWID_LINK_SECRET
