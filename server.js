@@ -534,6 +534,8 @@ After the lookup, the frontend injects a [SYSTEM: Returning student ...] message
 - Only guide them on the items that are actually missing/remaining (e.g., "$35.00 remaining on your book fee — here's the payment link").
 - NEVER tell a student to "check your email" or re-do a step the facts show is already complete.
 - The [SYSTEM] message may include INTERNAL STAFF NOTES for context (adjustments, special arrangements, past issues). These are CONFIDENTIAL: never quote them, never mention that notes exist, never reveal names/reasons/details from them. Use them ONLY to avoid giving wrong guidance (e.g., if notes show an arrangement was made, don't contradict it — acknowledge their account is in good standing and offer staff follow-up for specifics).
+- **Class dates**: the facts include the student's REGISTERED class name and start date when known. Use ONLY those. NEVER state a class date, schedule, or cohort from the LIVE CLASS AVAILABILITY list for a returning student — that list is for prospects, and quoting the wrong cohort's dates to an enrolled student is a serious error. If the facts don't include their class dates, simply don't mention dates.
+- **College partner**: for California-track students the college is ALWAYS Foothill College. Houston Community College (HCC) applies ONLY to Texas-track students — never mention HCC to a CA student.
 - **Not found** → They may have used a different email (offer to try another), or start a fresh enrollment.
 
 ## ENROLLMENT FLOW CONVERSATION STRATEGY
@@ -1765,6 +1767,29 @@ app.get("/api/enrollment-status", async (req, res) => {
       console.warn("[enrollment-status] notes fetch failed:", e.message);
     }
 
+    // The student's ACTUAL registered class (name + real dates) from their
+    // active Class Registration — so the bot never guesses dates from the
+    // open-classes list (it once told a student the wrong cohort's start
+    // date). Most recent active registration wins.
+    let className = null, classStartDate = null, classEndDate = null;
+    try {
+      const regQ = await sfQuery(
+        `SELECT yClasses__Class__r.Name, ` +
+        `yClasses__Class__r.yClasses__First_Session_Date__c, ` +
+        `yClasses__Class__r.yClasses__Last_Session_Date__c ` +
+        `FROM yClasses__Class_Registration__c ` +
+        `WHERE yClasses__Student__c = '${c.Id}' AND yClasses__Removed_Date__c = null ` +
+        `ORDER BY CreatedDate DESC LIMIT 1`);
+      const reg = (regQ.records || [])[0];
+      if (reg && reg.yClasses__Class__r) {
+        className = reg.yClasses__Class__r.Name || null;
+        classStartDate = reg.yClasses__Class__r.yClasses__First_Session_Date__c || null;
+        classEndDate = reg.yClasses__Class__r.yClasses__Last_Session_Date__c || null;
+      }
+    } catch (e) {
+      console.warn("[enrollment-status] class lookup failed:", e.message);
+    }
+
     // Auto-heal the stale status field for the one sanctioned transition:
     // fully paid but still 'Emails Sent' → 'Payment Received'. Same rule the
     // payment webhook applies; doing it here fixes records paid before the
@@ -1793,6 +1818,10 @@ app.get("/api/enrollment-status", async (req, res) => {
       enrollmentStatus: status,
       statusHealed,
       classSelection: c.Class_Selection__c,
+      // Real registered class (from the active Class Registration):
+      className,
+      classStartDate,
+      classEndDate,
       hasBoxSignRequest: !!c.Box_Sign_Request_ID__c,
       dasSignedDate: c.DAS_Signed_Date__c,
       // Itemized ground truth (the source the UI/bot should trust):
