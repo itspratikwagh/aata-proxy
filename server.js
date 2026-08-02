@@ -1521,23 +1521,48 @@ app.post("/api/stripe-webhook", async (req, res) => {
   if (!session || session.payment_status !== "paid") return;
 
   try {
-    // Enrollment email: prefer the custom field, fall back to billing email.
-    let email = "";
+    // ── Candidate emails, in priority order. Students TYPE the enrollment
+    // email custom field at checkout and real typos happen (observed:
+    // "outlook.vom" for .com, and a Spanish-keyboard ".es" suggestion
+    // replacing ".com"), while the billing email Stripe verified with a
+    // receipt is usually correct. So match against ALL plausible emails:
+    //   1. the typed "Enrollment email" custom field
+    //   2. the billing/receipt email (customer_details.email)
+    //   3. common-TLD-typo corrections of both (.vom/.con/etc → .com;
+    //      outlook.es → outlook.com style fixes for major providers)
+    let typedEmail = "";
     if (Array.isArray(session.custom_fields)) {
       for (const f of session.custom_fields) {
         const key = (f.key || "").toLowerCase();
         if (key.includes("enroll") || key.includes("email")) {
-          email = (f.text && f.text.value) || (f.numeric && f.numeric.value) || "";
+          typedEmail = (f.text && f.text.value) || (f.numeric && f.numeric.value) || "";
         }
       }
     }
-    if (!email && session.customer_details) email = session.customer_details.email || "";
-    email = String(email).trim().toLowerCase();
+    const billingEmail = (session.customer_details && session.customer_details.email) || "";
+    const payerName = (session.customer_details && session.customer_details.name) ||
+      (session.shipping_details && session.shipping_details.name) || "";
+
+    const fixTypos = (e) => {
+      const out = [];
+      const lower = String(e || "").trim().toLowerCase();
+      if (!lower || !lower.includes("@")) return out;
+      out.push(lower);
+      // TLD typos → .com
+      const tldFixed = lower.replace(/\.(vom|con|cmo|comm|ocm|cpm|xom)$/i, ".com");
+      if (tldFixed !== lower) out.push(tldFixed);
+      // Spanish-keyboard suggestion: provider.es typed instead of provider.com
+      const esFixed = lower.replace(/@(outlook|gmail|hotmail|yahoo|icloud)\.es$/i, "@$1.com");
+      if (esFixed !== lower) out.push(esFixed);
+      return out;
+    };
+    const candidates = [...new Set([...fixTypos(typedEmail), ...fixTypos(billingEmail)])];
+
     const amt = Number(session.amount_total || 0) / 100; // cents → dollars
     const guid = "stripe-" + session.id;
 
-    if (!email || !amt) {
-      console.warn("[stripe-webhook] missing email or amount", { email, amt });
+    if (!candidates.length || !amt) {
+      console.warn("[stripe-webhook] missing email or amount", { typedEmail, billingEmail, amt });
       await sfSendEmail("info@aatatraining.org", "AATA Stripe payment needs review — missing email",
         `A Stripe payment of $${amt.toFixed(2)} came in without a usable email (session ${session.id}). Log it manually.`);
       return;
@@ -1547,24 +1572,64 @@ app.post("/api/stripe-webhook", async (req, res) => {
       return;
     }
 
-    const safeEmail = email.replace(/'/g, "\\'");
-    const q = await sfQuery(
+    const STUDENT_FIELDS =
       `SELECT Id, FirstName, LastName, Email, Received_Book_Fees__c, Book_Fee_Due__c, Enrollment_Status__c ` +
-      `FROM Contact WHERE Email = '${safeEmail}' ` +
-      `AND Enrollment_Status__c IN ('DAS Signed','Emails Sent','Payment Received','Fully Enrolled') ` +
-      `ORDER BY CreatedDate DESC LIMIT 1`);
-    const student = q.records && q.records[0];
+      `FROM Contact `;
+    const STATUS_FILTER =
+      `Enrollment_Status__c IN ('DAS Signed','Emails Sent','Payment Received','Fully Enrolled') `;
+
+    // Try candidates in priority order — first exact email hit wins.
+    let student = null;
+    let matchedVia = null;
+    for (const cand of candidates) {
+      const safe = cand.replace(/'/g, "\\'");
+      const q = await sfQuery(
+        STUDENT_FIELDS + `WHERE Email = '${safe}' AND ` + STATUS_FILTER +
+        `ORDER BY CreatedDate DESC LIMIT 1`);
+      if (q.records && q.records[0]) {
+        student = q.records[0];
+        matchedVia = cand === candidates[0] ? "enrollment email" : `alternate email ${cand}`;
+        break;
+      }
+    }
+
+    // Last resort: unique full-name match (Stripe collects the payer's
+    // name + shipping name). Only applied when EXACTLY one student's
+    // first+last both appear in the payer name — ambiguity goes to review.
+    if (!student && payerName) {
+      const nameLc = payerName.toLowerCase();
+      const all = await sfQuery(STUDENT_FIELDS + `WHERE ` + STATUS_FILTER);
+      const nameHits = (all.records || []).filter((s) => {
+        const first = (s.FirstName || "").toLowerCase();
+        const last = (s.LastName || "").toLowerCase();
+        return first && last && nameLc.includes(first) && nameLc.includes(last);
+      });
+      if (nameHits.length === 1) {
+        student = nameHits[0];
+        matchedVia = `payer name "${payerName}"`;
+      }
+    }
+
     if (!student) {
-      console.warn("[stripe-webhook] no student match for", email);
+      console.warn("[stripe-webhook] no student match", { typedEmail, billingEmail, payerName });
       await sfSendEmail("info@aatatraining.org", "AATA Stripe payment needs review — no match",
-        `A Stripe payment of $${amt.toFixed(2)} from enrollment email "${email}" (session ${session.id}) ` +
-        `didn't match a student. They may have used a different email at checkout. Log it manually.`);
+        `A Stripe payment of $${amt.toFixed(2)} didn't match a student (session ${session.id}).\n\n` +
+        `Typed enrollment email: ${typedEmail || "—"}\n` +
+        `Billing/receipt email: ${billingEmail || "—"}\n` +
+        `Payer name: ${payerName || "—"}\n\n` +
+        `They may have typo'd both emails. Log it manually on the right Contact ` +
+        `(Received $ Book Fees field) and tag the Chatter note with [PAYMENT ${guid}] so retries dedupe.`);
       return;
+    }
+    if (matchedVia && matchedVia !== "enrollment email") {
+      console.log(`[stripe-webhook] matched via ${matchedVia} (typed field didn't match)`);
     }
 
     const result = await applyBookFeePayment(student, amt, {
       source: "Stripe (card/ACH)", receivedAt: new Date().toISOString().slice(0, 10), guid,
-      memo: `Stripe checkout ${session.id}`, raw: "",
+      memo: `Stripe checkout ${session.id}` +
+        (matchedVia && matchedVia !== "enrollment email" ? ` — matched via ${matchedVia}` : ""),
+      raw: "",
     });
     console.log(`[stripe-webhook] applied $${amt} to ${student.FirstName} ${student.LastName}`,
       "total", result.newTotal, "flipped", result.statusFlipped);
