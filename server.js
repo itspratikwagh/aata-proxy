@@ -302,7 +302,9 @@ async function buildSystemPrompt() {
         kind = "Night Class";
         schedule = "5:00 PM to 10:00 PM PST, Monday-Friday (~16 weeks)";
       }
-      classSection += `\n### ${c.Name} [${kind}]\n`;
+      const spots = Number(c.Spots_Remaining__c);
+      classSection += `\n### ${c.Name} [${kind}]${!isNaN(spots) && spots <= 0 ? " — FULL, DO NOT OFFER" : ""}\n`;
+      classSection += `- Class ID: ${c.Id}\n`;
       classSection += `- Schedule: ${schedule}\n`;
       classSection += `- Start Date: ${c.yClasses__First_Session_Date__c || "TBD"}\n`;
       classSection += `- End Date: ${c.yClasses__Last_Session_Date__c || "TBD"}\n`;
@@ -416,7 +418,11 @@ You will collect these fields, ONE AT A TIME, conversationally. Validate as you 
 6. **City**
 7. **State** (2-letter code)
 8. **Zip code** (5 digits)
-9. **Class preference** — must be one of: \`Day Class\` or \`Night Class\` (refer to LIVE CLASSES section above for current schedule + spots)
+9. **Class preference** — must be one of: \`Day Class\` or \`Night Class\` (refer to LIVE CLASSES section above for current schedule + spots).
+   **CRITICAL — cohort selection:** the LIVE CLASSES section may list MORE THAN ONE open cohort of the same type (e.g. two Day classes with different start dates). The student must end up in the EXACT cohort they chose:
+   - If more than one cohort of their chosen type has spots, ask which specific one (by name/start date) and confirm it back.
+   - If exactly one has spots, confirm that specific cohort by name ("that's the Oct 12 – Dec 18 Day class — correct?").
+   - Remember the chosen cohort's **Class ID** from the LIVE CLASSES section — you will include it in the marker as \`classId\`. NEVER pick a cohort the student didn't confirm, and never offer a full cohort (0 or negative spots).
 
 Rules for collection:
 - Ask for ONE field at a time. Wait for the user's reply before asking the next.
@@ -446,10 +452,11 @@ Once ALL 9 fields are collected (and the address has been re-confirmed in this d
 
 When they confirm (yes/correct/looks good/etc.), emit a single message containing ONLY the following marker as the LAST line of your response (after a friendly confirmation sentence):
 
-\`[CREATE_ENROLLMENT]{"firstName":"...","lastName":"...","email":"...","mobilePhone":"...","mailingStreet":"...","mailingCity":"...","mailingState":"...","mailingPostalCode":"...","classSelection":"Day Class","consentAgreed":true,"consentTimestamp":"2026-05-15T01:23:45Z"}\`
+\`[CREATE_ENROLLMENT]{"firstName":"...","lastName":"...","email":"...","mobilePhone":"...","mailingStreet":"...","mailingCity":"...","mailingState":"...","mailingPostalCode":"...","classSelection":"Day Class","classId":"a0y...","consentAgreed":true,"consentTimestamp":"2026-05-15T01:23:45Z"}\`
 
 CRITICAL FORMAT RULES for the marker:
 - Use exact key names shown above. Use \`Day Class\` or \`Night Class\` for classSelection (no dates, no extra words).
+- \`classId\` MUST be the Class ID of the exact cohort the student confirmed, copied verbatim from the LIVE CLASSES section. Without it the backend may guess the wrong cohort — always include it.
 - Wrap the JSON on a SINGLE line, no line breaks inside it. Use double quotes only. Escape any double quotes in user data.
 - Put NOTHING after the marker — it must be the last thing in your message.
 - Do NOT explain the marker to the user. Just emit a friendly "Submitting your enrollment now..." sentence and then the marker on the next line.
@@ -900,25 +907,55 @@ app.post("/api/create-enrollment", async (req, res) => {
   }
 
   try {
-    // 1. Find the matching open class in Salesforce (by Day vs Night in Name)
-    const classFilter = data.classSelection === "Day Class" ? "DAY" : "NIGHT";
-    const classQuery = await sfQuery(
-      `SELECT Id, Name, yClasses__First_Session_Date__c, Spots_Remaining__c ` +
-      // Filter to California track ONLY. Without this filter, if anyone ever
-      // creates a Texas-track class with "DAY" or "NIGHT" in the name and
-      // Registration_Open=true, the CA enrollment flow will silently match
-      // it and create the Class Registration against the wrong class. Treat
-      // null as CA for back-compat (existing CA classes pre-date the field).
-      `FROM yClasses__Class__c WHERE Registration_Open__c = true ` +
-      `AND (Program_Track__c = 'California' OR Program_Track__c = null) ` +
-      `AND Name LIKE '%${classFilter}%' ` +
-      `ORDER BY yClasses__First_Session_Date__c ASC LIMIT 1`
-    );
-    const matchedClass = (classQuery.records || [])[0];
+    // 1. Resolve the class. PREFERRED: the chatbot sends the exact classId
+    // the student confirmed (from the LIVE CLASS AVAILABILITY list) — with
+    // two cohorts of the same type open at once, "Day Class" alone is
+    // ambiguous and the old earliest-start fallback enrolled a student into
+    // the WRONG (and over-capacity) cohort after confirming another one.
+    let matchedClass = null;
+    const requestedClassId = String(data.classId || "").trim();
+    if (/^[a-zA-Z0-9]{15,18}$/.test(requestedClassId)) {
+      const byId = await sfQuery(
+        `SELECT Id, Name, yClasses__First_Session_Date__c, Spots_Remaining__c ` +
+        `FROM yClasses__Class__c WHERE Id = '${requestedClassId}' ` +
+        `AND Registration_Open__c = true ` +
+        `AND (Program_Track__c = 'California' OR Program_Track__c = null) LIMIT 1`
+      );
+      matchedClass = (byId.records || [])[0] || null;
+      if (!matchedClass) {
+        console.warn("[create-enrollment] classId rejected (not open/CA):", requestedClassId);
+        return res.status(409).json({
+          ok: false,
+          error: "That class is no longer open for registration. Please ask about current classes or contact info@aatatraining.org.",
+        });
+      }
+      if (Number(matchedClass.Spots_Remaining__c) <= 0) {
+        return res.status(409).json({
+          ok: false,
+          error: `${matchedClass.Name} is full. Please pick another class or contact info@aatatraining.org.`,
+        });
+      }
+    }
+
+    // Fallback (no classId from older chatbot builds): earliest open class
+    // of the requested type that still HAS SPOTS — never a full cohort.
+    if (!matchedClass) {
+      const classFilter = data.classSelection === "Day Class" ? "DAY" : "NIGHT";
+      const classQuery = await sfQuery(
+        `SELECT Id, Name, yClasses__First_Session_Date__c, Spots_Remaining__c ` +
+        // CA track ONLY (null = CA for back-compat) — see TX misroute incident.
+        `FROM yClasses__Class__c WHERE Registration_Open__c = true ` +
+        `AND (Program_Track__c = 'California' OR Program_Track__c = null) ` +
+        `AND Name LIKE '%${classFilter}%' ` +
+        `AND Spots_Remaining__c > 0 ` +
+        `ORDER BY yClasses__First_Session_Date__c ASC LIMIT 1`
+      );
+      matchedClass = (classQuery.records || [])[0];
+    }
     if (!matchedClass) {
       return res.status(409).json({
         ok: false,
-        error: `No open ${data.classSelection} found. Please contact info@aatatraining.org.`,
+        error: `No open ${data.classSelection} with available spots found. Please contact info@aatatraining.org.`,
       });
     }
 
