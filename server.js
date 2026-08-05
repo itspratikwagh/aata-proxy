@@ -262,20 +262,51 @@ async function fetchSalesforceClasses() {
     // Treat Program_Track__c = null as California for back-compat with
     // existing class records that pre-date the Program_Track field.
     const soql =
-      "SELECT Name, yClasses__First_Session_Date__c, yClasses__Last_Session_Date__c, " +
+      "SELECT Id, Name, yClasses__First_Session_Date__c, yClasses__Last_Session_Date__c, " +
       "Total_Spots__c, Enrollment_Count__c, Spots_Remaining__c, Registration_Open__c " +
       "FROM yClasses__Class__c WHERE Registration_Open__c = true " +
       "AND (Program_Track__c = 'California' OR Program_Track__c = null) " +
       "ORDER BY yClasses__First_Session_Date__c ASC";
     const result = await sfQuery(soql);
-    cachedClassData = result.records || [];
+    const classes = result.records || [];
+
+    // COMMITTED SEATS: a seat is only consumed by a student who has PAID any
+    // part of the book fee (Received_Book_Fees__c > 0) or been explicitly
+    // excused (Book_Fee_Due__c = 0). Unpaid registrations are claims that
+    // must not block paying students — raw registration counts were showing
+    // classes "full" (38-45 regs) when only 17-23 students had committed.
+    const committed = await committedCountsFor(classes.map((c) => c.Id));
+    for (const c of classes) {
+      c._committed = committed.get(c.Id) || 0;
+      const total = Number(c.Total_Spots__c);
+      c._committedRemaining = isNaN(total) ? null : total - c._committed;
+    }
+
+    cachedClassData = classes;
     lastSFFetch = now;
-    console.log("SF class data refreshed:", cachedClassData.length, "classes");
+    console.log("SF class data refreshed:", cachedClassData.length, "classes",
+      classes.map((c) => `${c.Name}: ${c._committed} committed`).join(" | "));
     return cachedClassData;
   } catch (err) {
     console.error("Failed to fetch SF classes:", err.message);
     return cachedClassData;
   }
+}
+
+// Committed-seat counts for a set of class ids: active registrations whose
+// student paid any book-fee amount OR was explicitly excused (fee due = 0).
+async function committedCountsFor(classIds) {
+  const map = new Map();
+  const ids = (classIds || []).filter((id) => /^[a-zA-Z0-9]{15,18}$/.test(String(id)));
+  if (!ids.length) return map;
+  const inClause = ids.map((id) => `'${id}'`).join(",");
+  const q = await sfQuery(
+    `SELECT yClasses__Class__c cid, COUNT(Id) n FROM yClasses__Class_Registration__c ` +
+    `WHERE yClasses__Class__c IN (${inClause}) AND yClasses__Removed_Date__c = null ` +
+    `AND (yClasses__Student__r.Received_Book_Fees__c > 0 OR yClasses__Student__r.Book_Fee_Due__c = 0) ` +
+    `GROUP BY yClasses__Class__c`);
+  for (const r of q.records || []) map.set(r.cid, Number(r.n) || 0);
+  return map;
 }
 
 // ============================================================
@@ -302,17 +333,20 @@ async function buildSystemPrompt() {
         kind = "Night Class";
         schedule = "5:00 PM to 10:00 PM PST, Monday-Friday (~16 weeks)";
       }
-      const spots = Number(c.Spots_Remaining__c);
+      // Spots are COMMITTED-seat based: only paid/excused students consume
+      // a seat. Unpaid registrations never block a paying student.
+      const spots = typeof c._committedRemaining === "number" ? c._committedRemaining : Number(c.Spots_Remaining__c);
       classSection += `\n### ${c.Name} [${kind}]${!isNaN(spots) && spots <= 0 ? " — FULL, DO NOT OFFER" : ""}\n`;
       classSection += `- Class ID: ${c.Id}\n`;
       classSection += `- Schedule: ${schedule}\n`;
       classSection += `- Start Date: ${c.yClasses__First_Session_Date__c || "TBD"}\n`;
       classSection += `- End Date: ${c.yClasses__Last_Session_Date__c || "TBD"}\n`;
       classSection += `- Total Spots: ${c.Total_Spots__c || "N/A"}\n`;
-      classSection += `- Enrolled: ${c.Enrollment_Count__c || 0}\n`;
-      classSection += `- Spots Remaining: ${c.Spots_Remaining__c || "N/A"}\n`;
+      classSection += `- Seats Committed (paid/excused): ${c._committed ?? "N/A"}\n`;
+      classSection += `- Spots Remaining: ${isNaN(spots) ? "N/A" : spots}\n`;
     });
     classSection += "\nIMPORTANT: Always cite the Schedule line above for class times — never say \"TBD\" if the schedule is filled in. Spots are limited; always mention how many spots are left to create urgency.\n";
+    classSection += "SEAT POLICY (share when relevant): a seat is only officially reserved once the student's first book-fee payment is received. Registering without paying does NOT hold a seat — paid students get priority.\n";
   } else {
     classSection = "## UPCOMING CLASSES\nClass schedule is being updated. Ask the student to email info@aatatraining.org for the latest class options.\n";
   }
@@ -371,6 +405,7 @@ ${classSection}
 - To split into two payments of $162.50 each, use the split-payment link and pay it twice: ${get("pay_link_split", "https://buy.stripe.com/7sY14mgTqgTZ4V1cTF0VO01")}
 - IMPORTANT for the student: at checkout, enter the SAME email you enrolled with in the "Enrollment email" field, so the payment is matched to your record automatically.
 - Payment must be completed at least 2 weeks before the class start date (or before the class fills — paid-in-full students get priority once it's full).
+- SEAT RESERVATION: a seat is only officially held once the FIRST book-fee payment is received (or AATA has excused the fee). Registering without paying does not reserve a seat.
 
 ## ENROLLMENT REQUIREMENTS
 - Prerequisites: NONE - just have a drive to learn
@@ -912,11 +947,21 @@ app.post("/api/create-enrollment", async (req, res) => {
     // two cohorts of the same type open at once, "Day Class" alone is
     // ambiguous and the old earliest-start fallback enrolled a student into
     // the WRONG (and over-capacity) cohort after confirming another one.
+    // Capacity uses the COMMITTED-seats model: a seat is consumed only by a
+    // paid (any amount) or explicitly excused (Book_Fee_Due__c = 0) student.
+    // Unpaid registrations are claims and never block a paying student.
+    const hasCommittedSeat = async (cls) => {
+      const total = Number(cls.Total_Spots__c);
+      if (isNaN(total)) return true; // no capacity configured — don't block
+      const counts = await committedCountsFor([cls.Id]);
+      return (counts.get(cls.Id) || 0) < total;
+    };
+
     let matchedClass = null;
     const requestedClassId = String(data.classId || "").trim();
     if (/^[a-zA-Z0-9]{15,18}$/.test(requestedClassId)) {
       const byId = await sfQuery(
-        `SELECT Id, Name, yClasses__First_Session_Date__c, Spots_Remaining__c ` +
+        `SELECT Id, Name, yClasses__First_Session_Date__c, Total_Spots__c ` +
         `FROM yClasses__Class__c WHERE Id = '${requestedClassId}' ` +
         `AND Registration_Open__c = true ` +
         `AND (Program_Track__c = 'California' OR Program_Track__c = null) LIMIT 1`
@@ -929,28 +974,29 @@ app.post("/api/create-enrollment", async (req, res) => {
           error: "That class is no longer open for registration. Please ask about current classes or contact info@aatatraining.org.",
         });
       }
-      if (Number(matchedClass.Spots_Remaining__c) <= 0) {
+      if (!(await hasCommittedSeat(matchedClass))) {
         return res.status(409).json({
           ok: false,
-          error: `${matchedClass.Name} is full. Please pick another class or contact info@aatatraining.org.`,
+          error: `${matchedClass.Name} is full (all seats held by paid students). Please pick another class or contact info@aatatraining.org.`,
         });
       }
     }
 
     // Fallback (no classId from older chatbot builds): earliest open class
-    // of the requested type that still HAS SPOTS — never a full cohort.
+    // of the requested type with a committed seat free — never a full cohort.
     if (!matchedClass) {
       const classFilter = data.classSelection === "Day Class" ? "DAY" : "NIGHT";
       const classQuery = await sfQuery(
-        `SELECT Id, Name, yClasses__First_Session_Date__c, Spots_Remaining__c ` +
+        `SELECT Id, Name, yClasses__First_Session_Date__c, Total_Spots__c ` +
         // CA track ONLY (null = CA for back-compat) — see TX misroute incident.
         `FROM yClasses__Class__c WHERE Registration_Open__c = true ` +
         `AND (Program_Track__c = 'California' OR Program_Track__c = null) ` +
         `AND Name LIKE '%${classFilter}%' ` +
-        `AND Spots_Remaining__c > 0 ` +
-        `ORDER BY yClasses__First_Session_Date__c ASC LIMIT 1`
+        `ORDER BY yClasses__First_Session_Date__c ASC`
       );
-      matchedClass = (classQuery.records || [])[0];
+      for (const cls of classQuery.records || []) {
+        if (await hasCommittedSeat(cls)) { matchedClass = cls; break; }
+      }
     }
     if (!matchedClass) {
       return res.status(409).json({
@@ -1959,8 +2005,9 @@ app.get("/api/available-classes", async (req, res) => {
       id: r.Id,
       name: r.Name,
       totalSpots: r.Total_Spots__c,
-      enrolled: r.Enrollment_Count__c,
-      spotsRemaining: r.Spots_Remaining__c,
+      // Committed-seats model: only paid/excused students consume a seat.
+      enrolled: typeof r._committed === "number" ? r._committed : r.Enrollment_Count__c,
+      spotsRemaining: typeof r._committedRemaining === "number" ? r._committedRemaining : r.Spots_Remaining__c,
       startDate: r.yClasses__First_Session_Date__c,
       endDate: r.yClasses__Last_Session_Date__c,
     }));
