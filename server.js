@@ -578,6 +578,7 @@ After the lookup, the frontend injects a [SYSTEM: Returning student ...] message
 - The [SYSTEM] message may include INTERNAL STAFF NOTES for context (adjustments, special arrangements, past issues). These are CONFIDENTIAL: never quote them, never mention that notes exist, never reveal names/reasons/details from them. Use them ONLY to avoid giving wrong guidance (e.g., if notes show an arrangement was made, don't contradict it — acknowledge their account is in good standing and offer staff follow-up for specifics).
 - **Class dates**: the facts include the student's REGISTERED class name and start date when known. Use ONLY those. NEVER state a class date, schedule, or cohort from the LIVE CLASS AVAILABILITY list for a returning student — that list is for prospects, and quoting the wrong cohort's dates to an enrolled student is a serious error. If the facts don't include their class dates, simply don't mention dates.
 - **College partner**: for California-track students the college is ALWAYS Foothill College. Houston Community College (HCC) applies ONLY to Texas-track students — never mention HCC to a CA student.
+- **TEXAS-track students**: their program (Texas Workforce Commission funding via HCC, coordinated by Patrick Kratochvil) has NO Foothill step, NO CWID, and NO $325 book fee — NEVER mention any of those to a TX student. If the facts show a registered class, confirm they're enrolled in that class (name + start date). For anything specific — paperwork, funding, schedule questions — direct them to Patrick Kratochvil at (281) 676-0356 or patrickaata@gmail.com.
 - **Not found** → They may have used a different email (offer to try another), or start a fresh enrollment.
 
 ## ENROLLMENT FLOW CONVERSATION STRATEGY
@@ -1874,7 +1875,7 @@ app.get("/api/enrollment-status", async (req, res) => {
     const soql =
       `SELECT Id, FirstName, LastName, Email, Enrollment_Status__c, Class_Selection__c, ` +
       `Box_Sign_Request_ID__c, DAS_Signed_Date__c, Foothill_CWID__c, Received_Book_Fees__c, ` +
-      `Book_Fee_Due__c ` +
+      `Book_Fee_Due__c, Program_Track__c, TX_Stage__c ` +
       `FROM Contact WHERE Email = '${safeEmail}' ` +
       `ORDER BY CreatedDate DESC LIMIT 1`;
     const result = await sfQuery(soql);
@@ -1938,6 +1939,27 @@ app.get("/api/enrollment-status", async (req, res) => {
       console.warn("[enrollment-status] class lookup failed:", e.message);
     }
 
+    // ── TEXAS TRACK: a completely different program (Texas Workforce
+    // Commission funding via Houston Community College, coordinated by
+    // Patrick Kratochvil). There is NO Foothill step, NO CWID, and NO $325
+    // book fee for TX students — showing them the CA checklist was flat
+    // wrong. Return a minimal TX shape: registered class + Patrick contact.
+    if (c.Program_Track__c === "Texas") {
+      return res.json({
+        found: true,
+        contactId: c.Id,
+        firstName: c.FirstName,
+        lastName: c.LastName,
+        email: c.Email,
+        programTrack: "Texas",
+        txStage: c.TX_Stage__c || null,
+        className,
+        classStartDate,
+        classEndDate,
+        internalNotes,
+      });
+    }
+
     // Auto-heal the stale status field for the one sanctioned transition:
     // fully paid but still 'Emails Sent' → 'Payment Received'. Same rule the
     // payment webhook applies; doing it here fixes records paid before the
@@ -1965,6 +1987,7 @@ app.get("/api/enrollment-status", async (req, res) => {
       email: c.Email,
       enrollmentStatus: status,
       statusHealed,
+      programTrack: c.Program_Track__c || "California",
       classSelection: c.Class_Selection__c,
       // Real registered class (from the active Class Registration):
       className,
