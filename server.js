@@ -396,14 +396,15 @@ ${classSection}
   - **Residency requirement**: To qualify, the student must have been a California resident for at least the past 1 year. If they recently moved to California (less than ~1 year), explain they may not be eligible yet and direct them to leave a message at https://www.aatatraining.org/apply so AATA staff can advise on alternatives.
 - **Texas Residents**: The Texas program is funded by the **Texas Workforce Commission** (Chapter 133 grant), administered through **Houston Community College**. Tuition, books, and supplies are all covered. Patrick Kratochvil is the local coordinator — when a TX prospect says they want to enroll, capture their basic info via the TX lead flow (see ENROLLMENT FLOW step 2b) then send them to Patrick's intake form.
 - Only additional cost: ${get("book_fee", "$325")} book fee for ASNT books (brand new hard copies shipped directly from ASNT to student's home via FedEx)
-- Book fee can be paid in one installment OR split into two equal payments (${get("book_split", "$162.50 each")})
+- The book fee can be paid all at once, or split into installments via Klarna at Stripe checkout (Klarna handles the split automatically — there is no separate "split payment" link anymore)
 - **Out-of-State Residents**: Funding is handled on a case-by-case basis. Direct them to leave a message at https://www.aatatraining.org/apply
 - IMPORTANT: Do NOT proactively mention veteran-specific funding.
 
-### Book Fee Payment ($325):
-- Pay securely online — card, Apple Pay, or bank transfer: ${get("pay_link", "https://buy.stripe.com/aFa00i46EfPVevB6vh0VO00")}
-- To split into two payments of $162.50 each, use the split-payment link and pay it twice: ${get("pay_link_split", "https://buy.stripe.com/7sY14mgTqgTZ4V1cTF0VO01")}
-- IMPORTANT for the student: at checkout, enter the SAME email you enrolled with in the "Enrollment email" field, so the payment is matched to your record automatically.
+### Book Fee Payment ($325) — offer ZELLE FIRST, then card:
+- **Zelle (preferred — no processing fees):** send to the Zelle tag **${get("zelle_tag", "dydx-ndt")}** (business name: DYDX NDT LLC). Tell the student to put their FULL NAME and the email they enrolled with in the Zelle memo/note so we can match it. Zelle payments are confirmed by AATA staff, usually within one business day.
+- **Card / Apple Pay / bank transfer (Stripe):** ${get("pay_link", "https://buy.stripe.com/aFa00i46EfPVevB6vh0VO00")}
+  - If they want to pay in installments, Klarna is offered right at Stripe checkout — it splits the $325 automatically. Do NOT send a separate split-payment link; that link is retired.
+- IMPORTANT for the student paying by card: at checkout, enter the SAME email you enrolled with in the "Enrollment email" field, so the payment is matched to your record automatically.
 - Payment must be completed at least 2 weeks before the class start date (or before the class fills — paid-in-full students get priority once it's full).
 - SEAT RESERVATION: a seat is only officially held once the FIRST book-fee payment is received (or AATA has excused the fee). Registering without paying does not reserve a seat.
 
@@ -1432,7 +1433,7 @@ app.post("/api/compose-reminder", async (req, res) => {
 - This is reminder #${reminderNumber || 1} to this student. Vary tone by number: 1=friendly nudge, 2=helpful check-in (offer help), 3=gentle urgency, 4=direct but kind, 5=final heads-up.
 - Outstanding items: ${outstanding.join("; ") || "none"} — cover ONLY these, in one email.
 - ${cwidMissing && cwidLink ? `Include this exact link for submitting the CWID: ${cwidLink} (present it as a button-style link "Submit your CWID"). Also mention they can simply reply to this email with the 8-digit number.` : ""}
-- ${(amountDue || 0) > 0 ? `Payment policy to convey naturally: whether paying $325 once or split in two $162.50 payments, the FULL amount must be received at least 2 weeks before the class start date${classStartDate ? ` (${classStartDate})` : ""} or before the class fills — once full, students who paid in full get priority.${spotsRemaining != null ? ` Spots remaining right now: ${spotsRemaining}.` : ""} Payment: pay the $325 securely at https://buy.stripe.com/aFa00i46EfPVevB6vh0VO00 (card, Apple Pay, or bank). To split into two $162.50 payments, use https://buy.stripe.com/7sY14mgTqgTZ4V1cTF0VO01 and pay it twice. At checkout they must enter the same email they enrolled with.` : ""}
+- ${(amountDue || 0) > 0 ? `Payment policy to convey naturally: the FULL amount must be received at least 2 weeks before the class start date${classStartDate ? ` (${classStartDate})` : ""} or before the class fills — once full, students who paid in full get priority.${spotsRemaining != null ? ` Spots remaining right now: ${spotsRemaining}.` : ""} Give BOTH payment options, Zelle first: (1) Zelle to the tag dydx-ndt (DYDX NDT LLC) — ask them to put their full name and enrollment email in the Zelle memo; (2) card, Apple Pay, or bank at https://buy.stripe.com/aFa00i46EfPVevB6vh0VO00 — and note Klarna is available at that checkout if they'd rather pay in installments. For the card option they must enter the same email they enrolled with. There is NO separate split-payment link — never mention one.` : ""}
 - ${lastReplyText ? `The student previously wrote: "${String(lastReplyText).slice(0, 600)}" — briefly acknowledge/answer it first.` : ""}
 - Never invent facts, dates, or amounts beyond what's given. Subject must ALWAYS be exactly "Re: Your AATA enrollment — next steps" (threading).`;
 
@@ -1558,9 +1559,10 @@ async function applyBookFeePayment(contact, amt, meta) {
         `your book fee is now PAID IN FULL. Your ASNT books will be shipped to your home via FedEx.\n\n` +
         `Thank you, and welcome aboard!\n\nAATA Team`
       : `Hi ${contact.FirstName},\n\nWe received your payment of $${amt.toFixed(2)} — thank you!\n\n` +
-        `Your book fee balance is now $${(feeDue - newTotal).toFixed(2)} (of the $${feeDue.toFixed(2)} total). ` +
-        `To pay the remaining balance, use the split-payment link: https://buy.stripe.com/7sY14mgTqgTZ4V1cTF0VO01 ` +
-        `(enter the same email you enrolled with).\n\n` +
+        `Your book fee balance is now $${(feeDue - newTotal).toFixed(2)} (of the $${feeDue.toFixed(2)} total).\n\n` +
+        `To pay the remaining balance, Zelle the exact amount to our business Zelle tag dydx-ndt (DYDX NDT LLC) ` +
+        `and put your full name in the memo. If you'd rather pay the balance by card, just reply to this email ` +
+        `and we'll send you a card link for that exact amount.\n\n` +
         `The full amount must be received at least 2 weeks before your class starts ` +
         `(or before the class fills — paid-in-full students get priority once it does).\n\nAATA Team`;
     await sfSendEmail(contact.Email, "Re: Your AATA enrollment — payment received", ackBody);
@@ -1844,7 +1846,7 @@ app.post("/api/log-payment", async (req, res) => {
           `Your book fee balance is now $${(feeDue - newTotal).toFixed(2)} (of the $${feeDue.toFixed(2)} total). ` +
           `A reminder: the full amount must be received at least 2 weeks before your class starts ` +
           `(or before the class fills — paid-in-full students get priority once it does).\n\n` +
-          `To pay the remaining balance, use the split-payment link: https://buy.stripe.com/7sY14mgTqgTZ4V1cTF0VO01 (enter the same email you enrolled with).\n\nAATA Team`;
+          `To pay the remaining balance, Zelle the exact amount to our business Zelle tag dydx-ndt (DYDX NDT LLC) with your full name in the memo, or reply to this email and we'll send you a card link for that exact amount.\n\nAATA Team`;
       await sfSendEmail(s.Email, "Re: Your AATA enrollment — payment received", ackBody);
     }
 
