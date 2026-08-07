@@ -405,7 +405,7 @@ ${classSection}
 - **Card / Apple Pay / bank transfer (Stripe):** ${get("pay_link", "https://buy.stripe.com/aFa00i46EfPVevB6vh0VO00")}
   - If they want to pay in installments, Klarna is offered right at Stripe checkout — it splits the $325 automatically. Do NOT send a separate split-payment link; that link is retired.
 - IMPORTANT for the student paying by card: at checkout, enter the SAME email you enrolled with in the "Enrollment email" field, so the payment is matched to your record automatically.
-- **PARTIAL BALANCES:** the card link charges a FIXED $325. If a student already paid part of their fee, NEVER hand them that link — it would overcharge them. Tell them to Zelle the exact remaining amount to ${get("zelle_tag", "dydx-ndt")}, or to ask AATA for a card link for that exact amount.
+- **PARTIAL BALANCES:** the card link charges a FIXED $325. If a student already paid part of their fee, NEVER hand them that link — it would overcharge them. Tell them to Zelle the exact remaining amount to ${get("zelle_tag", "dydx-ndt")}, or to email info@aatatraining.org to request a card link for that exact amount (never promise the bot itself will send a link).
 - Payment must be completed at least 2 weeks before the class start date (or before the class fills — paid-in-full students get priority once it's full).
 - SEAT RESERVATION: a seat is only officially held once the FIRST book-fee payment is received (or AATA has excused the fee). Registering without paying does not reserve a seat.
 
