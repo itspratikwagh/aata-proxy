@@ -1,0 +1,19 @@
+# Keeps the Render backup in lockstep with Railway. Render's own GitHub
+# auto-deploy has never fired for this repo (no webhook was ever created),
+# which left the backup months stale — students saw pre-committed-seats
+# seat counts whenever the chatbot failed over to it.
+name: Deploy to Render
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deploy hook
+        run: |
+          if [ -z "${{ secrets.RENDER_DEPLOY_HOOK }}" ]; then
+            echo "::error::RENDER_DEPLOY_HOOK secret is not set — Render was NOT deployed"
+            exit 1
+          fi
+          curl -sf -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"
