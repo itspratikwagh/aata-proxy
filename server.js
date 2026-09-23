@@ -1017,7 +1017,8 @@ app.post("/api/create-enrollment", async (req, res) => {
     // progress (signed DAS, CWID, fees, status) is preserved untouched.
     const safeEmail = email.replace(/'/g, "\\'");
     const existingQ = await sfQuery(
-      `SELECT Id, FirstName, Enrollment_Status__c FROM Contact ` +
+      `SELECT Id, FirstName, Enrollment_Status__c, Class_Selection__c, ` +
+      `Box_Sign_Request_ID__c, DAS_Signed_Date__c FROM Contact ` +
       `WHERE Email = '${safeEmail}' ORDER BY CreatedDate ASC LIMIT 1`
     );
     const existing = (existingQ.records || [])[0];
@@ -1038,6 +1039,19 @@ app.post("/api/create-enrollment", async (req, res) => {
       if (data.mailingCity)     refresh.MailingCity = data.mailingCity;
       if (data.mailingState)    refresh.MailingState = data.mailingState;
       if (data.mailingPostalCode) refresh.MailingPostalCode = data.mailingPostalCode;
+      // RETURNING STUDENT WITH NO DAS: reusing an existing Contact used to mean
+      // "never send an agreement", because AATA_ContactEnrollmentTrigger only
+      // ran on insert. A 2021 lead who re-enrolled in 2026 got a class seat and
+      // no DAS at all (Dominick Salcido). Setting Class_Selection__c here fires
+      // the trigger's after-update path, which sends the DAS exactly once.
+      // Only when nothing is in flight and nothing is signed, so students who
+      // already have a request or a signature are still never re-sent.
+      const noRequest = !existing.Box_Sign_Request_ID__c;
+      const neverSigned = !existing.DAS_Signed_Date__c;
+      if (noRequest && neverSigned && data.classSelection) {
+        refresh.Class_Selection__c = data.classSelection;
+        console.log("Returning contact has no DAS on file — setting Class_Selection__c to fire the DAS send:", contactId);
+      }
       if (Object.keys(refresh).length) {
         await sfUpdate("Contact", contactId, refresh)
           .catch((e) => console.warn("[create-enrollment] contact refresh failed:", e.message));
