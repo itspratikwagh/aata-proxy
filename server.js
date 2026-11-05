@@ -336,7 +336,7 @@ async function buildSystemPrompt() {
       // Spots are COMMITTED-seat based: only paid/excused students consume
       // a seat. Unpaid registrations never block a paying student.
       const spots = typeof c._committedRemaining === "number" ? c._committedRemaining : Number(c.Spots_Remaining__c);
-      classSection += `\n### ${c.Name} [${kind}]${!isNaN(spots) && spots <= 0 ? " — FULL, DO NOT OFFER" : ""}\n`;
+      classSection += `\n### ${c.Name} [${kind}]${!isNaN(spots) && spots <= 0 ? " — FULL, DO NOT OFFER FOR ENROLLMENT (waitlist available, see WAITLIST section)" : ""}\n`;
       classSection += `- Class ID: ${c.Id}\n`;
       classSection += `- Schedule: ${schedule}\n`;
       classSection += `- Start Date: ${c.yClasses__First_Session_Date__c || "TBD"}\n`;
@@ -582,6 +582,38 @@ After the lookup, the frontend injects a [SYSTEM: Returning student ...] message
 - **College partner**: for California-track students the college is ALWAYS Foothill College. Houston Community College (HCC) applies ONLY to Texas-track students — never mention HCC to a CA student.
 - **TEXAS-track students**: their program (Texas Workforce Commission funding via HCC, coordinated by Patrick Kratochvil) has NO Foothill step, NO CWID, and NO $325 book fee — NEVER mention Foothill, CWID, or book fees to a TX student, not even to say they don't apply (they're California-only concepts a TX student has never heard of). Just say their training is fully funded through the Texas Workforce Commission. If the facts show a registered class, confirm they're enrolled in that class (name + start date). For anything specific — paperwork, funding, schedule questions — direct them to Patrick Kratochvil at (281) 676-0356 or patrickaata@gmail.com.
 - **Not found** → They may have used a different email (offer to try another), or start a fresh enrollment.
+
+## WAITLIST FOR FULL CLASSES (California only)
+A class marked FULL in the UPCOMING CLASSES list cannot be enrolled in. NEVER emit [CREATE_ENROLLMENT] with a FULL class's ID. Instead, when a California student wants a FULL class (or every cohort of the type they want is FULL):
+1. Tell them plainly that cohort is full. If a different cohort in the list still has spots, mention it ONCE as an option, without pushing.
+2. Offer to add them to the waitlist for the full cohort. Be honest about what it means: the waitlist does NOT reserve a seat; if a seat opens, AATA staff contact people in the order they joined, by email. Never promise or estimate their chances or position.
+3. If they want the waitlist: make sure they are a California resident of 1+ year (ask if you don't already know; Texas → TX flow; out-of-state → https://www.aatatraining.org/apply). Then, unless they ALREADY consented earlier in this conversation, show this disclosure VERBATIM (start your reply with the word "Quick", no preamble):
+
+> "Quick heads-up before I add you — here's how we'll use your info:
+>
+> • **What we collect:** your name, email, phone (optional), and which class you're waiting for.
+> • **Why:** so AATA staff can contact you if a seat opens in that class.
+> • **Where it's stored:** AATA's Salesforce CRM (US-hosted). We do NOT sell your data, share it with marketers, or use it for any purpose outside enrollment and program administration.
+> • **Your rights:** you can email **info@aatatraining.org** any time to view, correct, or delete your data, or to come off the waitlist. Full privacy policy: **https://www.aatatraining.org/privacy**
+>
+> **Type 'I agree' to continue, or ask me any questions first.**"
+
+   Same consent rules as enrollment: wait for a clear yes and note the consent time.
+4. Collect ONE AT A TIME: full name, email, mobile phone (optional; accept "skip"). If another cohort exists, you may ask ONE optional question: "If a seat opened in [other cohort] instead, would you want to hear about that too?" Record the answer, plus any schedule constraint they volunteer (e.g. "works days"), as a short note.
+5. Confirm back briefly ("Got it: Jane Doe, jane@example.com, 555-1234, waitlist for the Jan 11 Night class. Adding you now…") and end your message with this marker on its own line:
+
+[JOIN_WAITLIST]{"fullName":"...","email":"...","phone":"...","classId":"a0y...","notes":"...","consentAgreed":true,"consentTimestamp":"2026-11-05T22:30:00Z"}
+
+CRITICAL FORMAT RULES for the marker:
+- The marker MUST be the very last thing in your message, JSON on one line, double quotes only.
+- classId MUST be the Class ID of the FULL cohort they chose, copied exactly from the UPCOMING CLASSES list.
+- Use "" for phone or notes if none. consentAgreed must be the boolean true.
+- Do NOT explain the marker; the frontend hides it, saves the request, and shows a confirmation card.
+
+After the marker, the frontend injects a [SYSTEM: Waitlist ...] message:
+- Added: one or two sentences. They're on the waitlist for that class; AATA will email them if a seat opens; nothing else to do now. No promises about getting a seat.
+- Already on the list: tell them they're already on the waitlist for that class (since the date given) and nothing more is needed.
+- Failed: apologize briefly and ask them to email info@aatatraining.org with their name and the class they want.
 
 ## ENROLLMENT FLOW CONVERSATION STRATEGY
 When a student says they want to enroll or are ready to sign up:
@@ -1227,6 +1259,156 @@ app.post("/api/create-tx-lead", async (req, res) => {
   } catch (err) {
     console.error("Create TX lead error:", err.message);
     res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ============================================================
+// JOIN WAITLIST — chatbot-collected name/email/phone for a FULL CA class
+// → Waitlist_Entry__c. Deliberately does NOT create a Contact or Class
+// Registration: those fire the DAS / Box Sign enrollment automation. If a
+// Contact with this email already exists we only LINK it (lookup field on
+// the waitlist record, no writes to the Contact).
+// ============================================================
+const WAITLIST_ACTIVE_STATUSES = ["Waiting", "Offered Spot"];
+
+function soqlStr(s) {
+  return String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+app.post("/api/join-waitlist", async (req, res) => {
+  const data = req.body || {};
+  const REQUIRED = ["fullName", "email", "classId"];
+  const missing = REQUIRED.filter((k) => !data[k] || String(data[k]).trim() === "");
+  if (missing.length) {
+    return res.status(400).json({ ok: false, error: "Missing required fields", missing });
+  }
+
+  const fullName = String(data.fullName).trim().replace(/\s+/g, " ").slice(0, 120);
+  const email = String(data.email).trim().toLowerCase();
+  const phone = data.phone ? String(data.phone).trim().slice(0, 40) : "";
+  const classId = String(data.classId).trim();
+  const studentNotes = data.notes ? String(data.notes).trim().slice(0, 1000) : "";
+
+  if (!/^[^\s@'\\]+@[^\s@'\\]+\.[^\s@'\\]+$/.test(email)) {
+    return res.status(400).json({ ok: false, error: "That email address doesn't look right. Please use a valid email." });
+  }
+  if (looksDisposableEmail(email)) {
+    return res.status(400).json({ ok: false, error: "Please use a real, non-temporary email address. That's where we'll contact you if a seat opens." });
+  }
+  if (looksFakeName(fullName)) {
+    return res.status(400).json({ ok: false, error: "Please enter your real full name." });
+  }
+  if (!/^[a-zA-Z0-9]{15,18}$/.test(classId)) {
+    return res.status(400).json({ ok: false, error: "Invalid class. Please ask about current classes or email info@aatatraining.org." });
+  }
+  if (data.consentAgreed !== true) {
+    return res.status(400).json({
+      ok: false,
+      error: "Consent to data collection is required before we can add you to the waitlist.",
+    });
+  }
+  let consentTs = data.consentTimestamp;
+  if (!consentTs || isNaN(Date.parse(consentTs))) {
+    consentTs = new Date().toISOString();
+  }
+  // Rate limit AFTER cheap validation so a student fixing a typo isn't
+  // locked out. 5 Salesforce-touching requests per IP per 24h: a real
+  // student joins one, maybe two cohorts. More than that is a spam loop.
+  if (!rateLimit(req, res, {
+    endpoint: "join-waitlist",
+    windowMs: 24 * 60 * 60 * 1000,
+    max: 5,
+    message: "We've already received several waitlist requests from this device today. If you need to change something, email info@aatatraining.org.",
+  })) return;
+
+  if (!SF_CLIENT_ID || !SF_CLIENT_SECRET) {
+    return res.status(500).json({ ok: false, error: "SF credentials not configured" });
+  }
+
+  try {
+    // 1. Class must be an upcoming CA-track class (null track = CA, same
+    // back-compat rule as everywhere else). Registration_Open is NOT
+    // required: a full class may have registration closed but still
+    // accept waitlist requests.
+    const clsQ = await sfQuery(
+      `SELECT Id, Name, yClasses__First_Session_Date__c FROM yClasses__Class__c ` +
+      `WHERE Id = '${classId}' AND (Program_Track__c = 'California' OR Program_Track__c = null) ` +
+      `AND yClasses__First_Session_Date__c >= TODAY LIMIT 1`
+    );
+    const cls = (clsQ.records || [])[0];
+    if (!cls) {
+      console.warn("[join-waitlist] classId rejected (not upcoming/CA):", classId, Array.isArray(clsQ) ? clsQ : "");
+      return res.status(409).json({
+        ok: false,
+        error: "That class isn't available for a waitlist. Please ask about current classes or email info@aatatraining.org.",
+      });
+    }
+
+    // 2. Dedupe: already actively waiting for this class → don't add again.
+    const statusList = WAITLIST_ACTIVE_STATUSES.map((s) => `'${s}'`).join(",");
+    const dupQ = await sfQuery(
+      `SELECT Id, Name, Waitlist_Status__c, Request_Date__c FROM Waitlist_Entry__c ` +
+      `WHERE Email__c = '${soqlStr(email)}' AND Class__c = '${cls.Id}' ` +
+      `AND Waitlist_Status__c IN (${statusList}) LIMIT 1`
+    );
+    if (Array.isArray(dupQ)) {
+      console.error("[join-waitlist] dedupe query failed:", dupQ);
+      return res.status(500).json({ ok: false, error: "Waitlist lookup failed. Please email info@aatatraining.org." });
+    }
+    const dup = (dupQ.records || [])[0];
+    if (dup) {
+      console.log(`[join-waitlist] ${email} already on waitlist ${dup.Name} for ${cls.Name}`);
+      return res.json({
+        ok: true,
+        alreadyOnList: true,
+        entryNumber: dup.Name,
+        className: cls.Name,
+        classStartDate: cls.yClasses__First_Session_Date__c,
+        requestDate: dup.Request_Date__c,
+      });
+    }
+
+    // 3. Link an existing Contact (read-only lookup, no Contact writes).
+    const conQ = await sfQuery(`SELECT Id FROM Contact WHERE Email = '${soqlStr(email)}' LIMIT 1`);
+    const contactId = (conQ.records || [])[0]?.Id || null;
+
+    // 4. Create the entry. Request date = today in Pacific time.
+    const todayPT = new Date().toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
+    const nowPT = new Date().toLocaleString("en-US", { timeZone: "America/Los_Angeles" });
+    let notes = `Source: website chatbot, ${nowPT} PT. Data-collection consent given ${consentTs}.`;
+    if (studentNotes) notes += `\nStudent notes: ${studentNotes}`;
+
+    const payload = {
+      Class__c: cls.Id,
+      Full_Name__c: fullName,
+      Email__c: email,
+      Request_Date__c: todayPT,
+      Waitlist_Status__c: "Waiting",
+      Notes__c: notes,
+    };
+    if (phone) payload.Phone__c = phone;
+    if (contactId) payload.Contact__c = contactId;
+
+    const createRes = await sfCreate("Waitlist_Entry__c", payload);
+    if (createRes.status !== 201 || !createRes.body.id) {
+      console.error("[join-waitlist] create failed:", createRes.body);
+      return res.status(500).json({ ok: false, error: "Couldn't save your waitlist request. Please email info@aatatraining.org." });
+    }
+    const entryQ = await sfQuery(`SELECT Name FROM Waitlist_Entry__c WHERE Id = '${createRes.body.id}' LIMIT 1`);
+    const entryNumber = (entryQ.records || [])[0]?.Name || null;
+    console.log(`[join-waitlist] Added ${email} to ${cls.Name} as ${entryNumber || createRes.body.id}${contactId ? ` (Contact ${contactId})` : ""}`);
+
+    res.json({
+      ok: true,
+      alreadyOnList: false,
+      entryNumber,
+      className: cls.Name,
+      classStartDate: cls.yClasses__First_Session_Date__c,
+      requestDate: todayPT,
+    });
+  } catch (err) {
+    console.error("[join-waitlist] error:", err.message);
+    res.status(500).json({ ok: false, error: "Something went wrong saving your waitlist request. Please email info@aatatraining.org." });
   }
 });
 
